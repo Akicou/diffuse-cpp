@@ -32,6 +32,7 @@ Until now, dLLMs ran exclusively on GPU with PyTorch. diffuse-cpp brings them to
 |-------|----------|--------|-----------|-----------|
 | [LLaDA-8B-Instruct](https://huggingface.co/GSAI-ML/LLaDA-8B-Instruct) | Llama | 8B | MHA (32/32) | `convert-llada.py` |
 | [Dream-v0-Instruct-7B](https://huggingface.co/Dream-org/Dream-v0-Instruct-7B) | Qwen2.5 | 7.6B | GQA (28/4) | `convert-dream.py` |
+| [LLaDA2.2-flash](https://huggingface.co/inclusionAI/LLaDA2.2-flash) | Custom MoE | 150B (13B active) | GQA (32/4) | `convert-llada2.py` |
 
 ## Benchmark Results
 
@@ -142,6 +143,11 @@ python tools/convert-llada.py \
 python tools/convert-dream.py \
     --input /path/to/Dream-v0-Instruct-7B \
     --output dream-7b-f16.gguf
+
+# LLaDA2.2-flash (MoE)
+python tools/convert-llada2.py \
+    --input /path/to/LLaDA2.2-flash \
+    --output llada2-flash-f16.gguf --type f16
 ```
 
 Quantize to Q4_K_M (recommended for best performance):
@@ -164,6 +170,7 @@ Available quantization formats:
 |-------|-------------|---------------|--------|
 | [LLaDA-8B-Instruct](https://huggingface.co/GSAI-ML/LLaDA-8B-Instruct) | Llama, MHA (32/32) | [diffuse-cpp/LLaDA-8B-Instruct-GGUF](https://huggingface.co/diffuse-cpp/LLaDA-8B-Instruct-GGUF) | Production |
 | [Dream-v0-Instruct-7B](https://huggingface.co/Dream-org/Dream-v0-Instruct-7B) | Qwen2.5, GQA (28/4) | [diffuse-cpp/Dream-v0-Instruct-7B-GGUF](https://huggingface.co/diffuse-cpp/Dream-v0-Instruct-7B-GGUF) | Production |
+| [LLaDA2.2-flash](https://huggingface.co/inclusionAI/LLaDA2.2-flash) | Custom MoE, GQA (32/4), QK-norm, partial-RoPE | — | Experimental |
 
 PRs welcome for additional masked diffusion architectures.
 
