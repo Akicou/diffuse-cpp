@@ -178,6 +178,103 @@ def main():
     writer.add_uint32("diffuse.delete_token_id", 156930)
     writer.add_uint32("diffuse.split_token_id", 156931)
 
+    # ── Embed tokenizer ────────────────────────────────────────────
+    print("Embedding tokenizer...")
+    try:
+        from transformers import AutoTokenizer
+        hf_tok = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
+
+        # Extract vocabulary sorted by ID
+        vocab = hf_tok.get_vocab()
+        sorted_vocab = sorted(vocab.items(), key=lambda x: x[1])
+        token_list = [t for t, _ in sorted_vocab]
+        n_tok = len(token_list)
+
+        # Determine token types
+        special_tokens = set()
+        if hasattr(hf_tok, 'get_added_vocab'):
+            for t in hf_tok.get_added_vocab():
+                special_tokens.add(t)
+
+        token_types = []
+        for t in token_list:
+            if t in special_tokens or t.startswith('<|') or t in ('<s>', '</s>', '<unk>', '<pad>', '<mask>'):
+                token_types.append(3)  # CONTROL
+            else:
+                token_types.append(1)  # NORMAL
+
+        # Tokenizer model name
+        tok_model = "gpt2"  # BPE default
+        # Check if it's a SentencePiece tokenizer
+        if hasattr(hf_tok, 'vocab_files_names'):
+            if 'model' in str(hf_tok.vocab_files_names):
+                sp_path = os.path.join(model_dir, 'tokenizer.model')
+                if os.path.exists(sp_path):
+                    tok_model = "llama"
+
+        writer.add_string("tokenizer.ggml.model", tok_model)
+        writer.add_token_list(token_list)
+        writer.add_token_types(token_types)
+        writer.add_token_scores([0.0] * n_tok)
+
+        # BPE merges (if gpt2-style)
+        if tok_model == "gpt2":
+            merges_path = os.path.join(model_dir, "merges.txt")
+            if os.path.exists(merges_path):
+                merges = []
+                with open(merges_path, encoding="utf-8") as mf:
+                    for line in mf:
+                        line = line.rstrip('\n')
+                        if line and not line.startswith('#'):
+                            merges.append(line)
+                writer.add_token_merges(merges)
+                print(f"  Embedded {len(merges)} BPE merges")
+            else:
+                # Try extracting from fast tokenizer backend
+                try:
+                    backend = hf_tok.backend_tokenizer.model
+                    if hasattr(backend, 'merges'):
+                        merges = [f"{a} {b}" for a, b in backend.merges]
+                        writer.add_token_merges(merges)
+                        print(f"  Embedded {len(merges)} BPE merges (from backend)")
+                except Exception as e:
+                    print(f"  WARNING: Could not extract merges: {e}")
+
+        # Special token IDs
+        for attr, gguf_key in [
+            ('bos_token_id', 'tokenizer.ggml.bos_token_id'),
+            ('eos_token_id', 'tokenizer.ggml.eos_token_id'),
+            ('unk_token_id', 'tokenizer.ggml.unknown_token_id'),
+            ('pad_token_id', 'tokenizer.ggml.padding_token_id'),
+        ]:
+            val = getattr(hf_tok, attr, None)
+            if val is not None:
+                writer.add_uint32(gguf_key, int(val))
+
+        # Mask token
+        writer.add_uint32("tokenizer.ggml.mask_token_id", mask_token_id)
+
+        # add_bos / add_eos flags
+        add_bos = getattr(hf_tok, 'add_bos_token', False)
+        add_eos = getattr(hf_tok, 'add_eos_token', False)
+        writer.add_bool("tokenizer.ggml.add_bos_token", bool(add_bos))
+        writer.add_bool("tokenizer.ggml.add_eos_token", bool(add_eos))
+
+        # Chat template
+        if hasattr(hf_tok, 'chat_template') and hf_tok.chat_template:
+            writer.add_string("tokenizer.chat_template", hf_tok.chat_template)
+
+        print(f"  Embedded {n_tok} tokens, model={tok_model}")
+        del hf_tok  # Free memory
+
+    except ImportError:
+        print("  WARNING: transformers not available, skipping tokenizer embedding")
+        print("  The model will require external tokenization (Python + transformers)")
+    except Exception as e:
+        print(f"  WARNING: Failed to embed tokenizer: {e}")
+        import traceback
+        traceback.print_exc()
+
     # ── Global tensors ─────────────────────────────────────────────
     print("Writing global tensors...")
 

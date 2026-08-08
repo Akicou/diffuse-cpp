@@ -1,4 +1,5 @@
 #include "diffuse.h"
+#include "diffuse-tokenizer.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -9,22 +10,21 @@
 static void print_usage(const char * prog) {
     fprintf(stderr, "Usage: %s [options]\n", prog);
     fprintf(stderr, "\nOptions:\n");
-    fprintf(stderr, "  -m PATH     Model file (GGUF)\n");
-    fprintf(stderr, "  -p TEXT     Prompt text\n");
-    fprintf(stderr, "  -n INT      Tokens to generate (default: 128)\n");
-    fprintf(stderr, "  -s INT      Diffusion steps (default: 32)\n");
+    fprintf(stderr, "  -m PATH     Model file (GGUF) [required]\n");
+    fprintf(stderr, "  -p TEXT     Prompt text (requires embedded tokenizer)\n");
+    fprintf(stderr, "  -n INT      Tokens to generate (default: 256)\n");
+    fprintf(stderr, "  -s INT      Diffusion steps (default: 16)\n");
     fprintf(stderr, "  -t INT      Threads (default: 4)\n");
     fprintf(stderr, "  -ngl INT    GPU layers to offload (default: 0 = CPU only)\n");
     fprintf(stderr, "  --temp F    Temperature (default: 0 = argmax)\n");
     fprintf(stderr, "  --seed INT  Random seed (default: 42)\n");
     fprintf(stderr, "  --schedule  cosine|linear (default: cosine)\n");
-    fprintf(stderr, "  --remasking low_confidence|random|entropy_exit|maskgit_plus|topk_margin (default: low_confidence)\n");
+    fprintf(stderr, "  --remasking low_confidence|random|entropy_exit (default: entropy_exit)\n");
     fprintf(stderr, "  --entropy-threshold F  Entropy threshold for entropy_exit (default: 1.5)\n");
-    fprintf(stderr, "  --cache-refresh INT   Force full forward every N steps (default: 0 = never)\n");
-    fprintf(stderr, "  --cache-keep-active INT  Keep recently-changed positions active N extra steps (default: 0)\n");
-    fprintf(stderr, "\nNote: Tokenization is currently external. Use --tokens to pass\n");
-    fprintf(stderr, "      pre-tokenized input as comma-separated IDs.\n");
-    fprintf(stderr, "  --tokens IDs  Comma-separated token IDs (bypasses prompt)\n");
+    fprintf(stderr, "  --no-cache  Disable inter-step KV cache\n");
+    fprintf(stderr, "  --system TEXT  System prompt (default: 'You are a helpful assistant.')\n");
+    fprintf(stderr, "  --tokens IDs  Comma-separated token IDs (bypasses tokenizer)\n");
+    fprintf(stderr, "  --raw       Don't apply chat template, tokenize raw prompt\n");
 }
 
 static std::vector<int32_t> parse_tokens(const char * str) {
@@ -41,19 +41,19 @@ static std::vector<int32_t> parse_tokens(const char * str) {
 int main(int argc, char ** argv) {
     std::string model_path;
     std::string prompt;
+    std::string system_prompt = "You are a helpful assistant.";
     std::vector<int32_t> input_tokens;
-    int n_generate = 128;
-    int n_steps    = 32;
+    int n_generate = 256;
+    int n_steps    = 16;
     int n_threads  = 4;
     int n_gpu_layers = 0;
     float temperature = 0.0f;
     float entropy_threshold = 1.5f;
     uint32_t seed  = 42;
     diffuse_schedule schedule = diffuse_schedule::COSINE;
-    diffuse_remasking remasking = diffuse_remasking::LOW_CONFIDENCE;
+    diffuse_remasking remasking = diffuse_remasking::ENTROPY_EXIT;
     bool use_cache = true;
-    int cache_refresh = 0;
-    int cache_keep_active = 0;
+    bool raw = false;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
@@ -81,16 +81,15 @@ int main(int argc, char ** argv) {
             entropy_threshold = atof(argv[++i]);
         } else if (strcmp(argv[i], "--remasking") == 0 && i + 1 < argc) {
             i++;
-            if (strcmp(argv[i], "random") == 0) remasking = diffuse_remasking::RANDOM;
+            if (strcmp(argv[i], "low_confidence") == 0) remasking = diffuse_remasking::LOW_CONFIDENCE;
+            else if (strcmp(argv[i], "random") == 0) remasking = diffuse_remasking::RANDOM;
             else if (strcmp(argv[i], "entropy_exit") == 0) remasking = diffuse_remasking::ENTROPY_EXIT;
-            else if (strcmp(argv[i], "maskgit_plus") == 0) remasking = diffuse_remasking::MASKGIT_PLUS;
-            else if (strcmp(argv[i], "topk_margin") == 0) remasking = diffuse_remasking::TOPK_MARGIN;
         } else if (strcmp(argv[i], "--no-cache") == 0) {
             use_cache = false;
-        } else if (strcmp(argv[i], "--cache-refresh") == 0 && i + 1 < argc) {
-            cache_refresh = atoi(argv[++i]);
-        } else if (strcmp(argv[i], "--cache-keep-active") == 0 && i + 1 < argc) {
-            cache_keep_active = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--system") == 0 && i + 1 < argc) {
+            system_prompt = argv[++i];
+        } else if (strcmp(argv[i], "--raw") == 0) {
+            raw = true;
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             print_usage(argv[0]);
             return 0;
@@ -107,16 +106,6 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    // Native tokenizer not integrated; use --tokens with pre-tokenized input
-    if (input_tokens.empty()) {
-        fprintf(stderr, "Warning: native tokenizer not yet integrated. "
-                        "Use --tokens with pre-tokenized input.\n");
-        fprintf(stderr, "Example: python -c \"from transformers import AutoTokenizer; "
-                        "t=AutoTokenizer.from_pretrained('GSAI-ML/LLaDA-8B-Instruct'); "
-                        "print(','.join(map(str,t.encode('%s'))))\"\n", prompt.c_str());
-        return 1;
-    }
-
     // Load model
     fprintf(stderr, "Loading model...\n");
     diffuse_model * model = diffuse_model_load(model_path, n_threads);
@@ -125,6 +114,34 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    // Load tokenizer (for text prompt and output decoding)
+    diffuse_tokenizer * tokenizer = diffuse_tokenizer_load(model_path);
+
+    // Tokenize input
+    if (input_tokens.empty()) {
+        if (!tokenizer || !diffuse_tokenizer_ready(tokenizer)) {
+            fprintf(stderr, "Error: model has no embedded tokenizer.\n");
+            fprintf(stderr, "Re-convert with tokenizer embedding, or use --tokens for raw IDs.\n");
+            diffuse_model_free(model);
+            return 1;
+        }
+
+        if (raw) {
+            input_tokens = diffuse_tokenize(tokenizer, prompt, true);
+        } else {
+            // Apply chat template
+            std::vector<diffuse_chat_message> messages;
+            if (!system_prompt.empty()) {
+                messages.push_back({"system", system_prompt});
+            }
+            messages.push_back({"user", prompt});
+            input_tokens = diffuse_apply_chat_template(tokenizer, messages, true);
+        }
+
+        fprintf(stderr, "Prompt: %zu tokens\n", input_tokens.size());
+    }
+
+    // Setup context
     const auto & hp = diffuse_model_hparams(model);
     int n_ctx = (int)input_tokens.size() + n_generate;
     diffuse_context * ctx = diffuse_context_new_gpu(model, n_ctx, n_threads, n_gpu_layers);
@@ -137,32 +154,37 @@ int main(int argc, char ** argv) {
     sparams.schedule    = schedule;
     sparams.remasking   = remasking;
     sparams.entropy_threshold = entropy_threshold;
-    sparams.use_cache = use_cache;
-    sparams.cache_refresh = cache_refresh;
-    sparams.cache_keep_active = cache_keep_active;
+    sparams.use_cache   = use_cache;
 
     // Generate
     fprintf(stderr, "Generating %d tokens with %d diffusion steps...\n", n_generate, n_steps);
 
     auto result = diffuse_generate(ctx, input_tokens, n_generate, sparams,
-        [](int step, int total, const std::vector<int32_t> & tokens) {
+        [](int step, int total, const std::vector<int32_t> &) {
             fprintf(stderr, "\r  step %d/%d", step, total);
         });
 
-    fprintf(stderr, "\n\nGenerated token IDs:\n");
-    for (size_t i = 0; i < result.size(); i++) {
-        if (i > 0) printf(",");
-        printf("%d", result[i]);
-    }
-    printf("\n");
+    fprintf(stderr, "\n\n");
 
-    fprintf(stderr, "\nDecode with: python -c \"from transformers import AutoTokenizer; "
-                    "t=AutoTokenizer.from_pretrained('GSAI-ML/LLaDA-8B-Instruct'); "
-                    "print(t.decode([...]))\"\n");
+    // Output
+    if (tokenizer && diffuse_tokenizer_ready(tokenizer)) {
+        // Decode to text
+        std::string text = diffuse_detokenize(tokenizer, result, true);
+        printf("%s\n", text.c_str());
+    } else {
+        // Output token IDs
+        fprintf(stderr, "Generated token IDs:\n");
+        for (size_t i = 0; i < result.size(); i++) {
+            if (i > 0) printf(",");
+            printf("%d", result[i]);
+        }
+        printf("\n");
+    }
 
     // Cleanup
     diffuse_context_free(ctx);
     diffuse_model_free(model);
+    if (tokenizer) diffuse_tokenizer_free(tokenizer);
 
     return 0;
 }

@@ -32,27 +32,6 @@ static inline std::string fmt_layer(const char * pattern, int i) {
     return buf;
 }
 
-// ── Per-layer weight struct ────────────────────────────────────
-struct diffuse_layer {
-    // Attention
-    struct ggml_tensor * attn_norm;   // RMSNorm weight
-    struct ggml_tensor * wq;          // Q projection
-    struct ggml_tensor * wk;          // K projection
-    struct ggml_tensor * wv;          // V projection
-    struct ggml_tensor * wo;          // output projection
-
-    // QKV biases (optional, nullptr for models without them e.g. LLaDA)
-    struct ggml_tensor * bq = nullptr;  // Q bias (Dream/Qwen2.5)
-    struct ggml_tensor * bk = nullptr;  // K bias
-    struct ggml_tensor * bv = nullptr;  // V bias
-
-    // FFN (SwiGLU)
-    struct ggml_tensor * ffn_norm;    // RMSNorm weight
-    struct ggml_tensor * ffn_gate;    // gate projection (w1)
-    struct ggml_tensor * ffn_up;      // up projection (w3)
-    struct ggml_tensor * ffn_down;    // down projection (w2)
-};
-
 // ── LLaDA2 MoE layer (diffusion MoE) ───────────────────────────
 struct diffuse_moe_layer {
     // Attention (fused QKV + QK norm + partial rotary)
@@ -94,7 +73,6 @@ struct diffuse_model {
     struct ggml_tensor * output;      // lm_head (may be tied to tok_embd)
 
     // Layers
-    std::vector<diffuse_layer> layers;
     std::vector<diffuse_moe_layer> moe_layers;  // LLaDA2 MoE layers
 
     // MoE hyperparameters (LLaDA2)

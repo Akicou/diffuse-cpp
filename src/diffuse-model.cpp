@@ -113,26 +113,21 @@ diffuse_model * diffuse_model_load_impl(const std::string & path, int n_threads)
     hp.rope_theta    = get_f32_multi(gctx, "rope.freq_base", 1000000.0f);
     hp.rms_norm_eps  = get_f32_multi(gctx, "attention.layer_norm_rms_epsilon", 1e-6f);
 
-    // Read model type
+    // Read model type (only llada2_moe is supported)
     {
         int64_t id = gguf_find_key(gctx, "diffuse.model_type");
         if (id >= 0) {
             model->model_type = gguf_get_val_str(gctx, id);
-        } else if (arch == "qwen2") {
-            model->model_type = "qwen2";  // autoregressive Qwen2.5
-        } else if (arch == "llama") {
-            model->model_type = "llama";  // autoregressive Llama
         } else {
-            model->model_type = "llada";  // default for older diffuse GGUF files
+            model->model_type = "llada2_moe";
         }
     }
 
-    const char * arch_name = "unknown";
-    if (model->model_type == "llada")  arch_name = "LLaDA (Llama backbone, diffusion)";
-    else if (model->model_type == "dream")  arch_name = "Dream (Qwen2.5 backbone, diffusion)";
-    else if (model->model_type == "llada2_moe")  arch_name = "LLaDA2 MoE (diffusion)";
-    else if (model->model_type == "qwen2")  arch_name = "Qwen2.5 (autoregressive)";
-    else if (model->model_type == "llama")  arch_name = "Llama (autoregressive)";
+    if (model->model_type != "llada2_moe") {
+        DIFFUSE_DIE("unsupported model type: %s (only llada2_moe is supported)", model->model_type.c_str());
+    }
+
+    const char * arch_name = "LLaDA2 MoE (diffusion)";
 
     DIFFUSE_LOG("  arch: %s", arch_name);
     DIFFUSE_LOG("  n_vocab=%u, n_embd=%u, n_head=%u/%u(kv), n_layer=%u, n_ff=%u",
@@ -158,31 +153,8 @@ diffuse_model * diffuse_model_load_impl(const std::string & path, int n_threads)
     struct ggml_tensor * lm_head = ggml_get_tensor(meta_ctx, "output.weight");
     model->output = lm_head ? lm_head : model->tok_embd;
 
-    // Layers
-    model->layers.resize(hp.n_layer);
-    // Skip standard layer loading for MoE models (loaded below)
-    if (model->model_type != "llada2_moe") {
-    for (uint32_t i = 0; i < hp.n_layer; i++) {
-        auto & l = model->layers[i];
-        l.attn_norm = get_tensor(meta_ctx, fmt_layer("blk.%d.attn_norm.weight", i).c_str());
-        l.wq       = get_tensor(meta_ctx, fmt_layer("blk.%d.attn_q.weight", i).c_str());
-        l.wk       = get_tensor(meta_ctx, fmt_layer("blk.%d.attn_k.weight", i).c_str());
-        l.wv       = get_tensor(meta_ctx, fmt_layer("blk.%d.attn_v.weight", i).c_str());
-        l.wo       = get_tensor(meta_ctx, fmt_layer("blk.%d.attn_output.weight", i).c_str());
-        l.ffn_norm = get_tensor(meta_ctx, fmt_layer("blk.%d.ffn_norm.weight", i).c_str());
-        l.ffn_gate = get_tensor(meta_ctx, fmt_layer("blk.%d.ffn_gate.weight", i).c_str());
-        l.ffn_up   = get_tensor(meta_ctx, fmt_layer("blk.%d.ffn_up.weight", i).c_str());
-        l.ffn_down = get_tensor(meta_ctx, fmt_layer("blk.%d.ffn_down.weight", i).c_str());
-
-        // Optional QKV biases (Dream/Qwen2.5 has them, LLaDA does not)
-        l.bq = ggml_get_tensor(meta_ctx, fmt_layer("blk.%d.attn_q.bias", i).c_str());
-        l.bk = ggml_get_tensor(meta_ctx, fmt_layer("blk.%d.attn_k.bias", i).c_str());
-        l.bv = ggml_get_tensor(meta_ctx, fmt_layer("blk.%d.attn_v.bias", i).c_str());
-    }  // close for loop
-    }  // close if (not llada2_moe)
-
-    // ── Load LLaDA2 MoE layers (if model is llada2_moe) ──────────
-    if (model->model_type == "llada2_moe") {
+    // ── Load LLaDA2 MoE layers ──────────────────────────────────
+    {
         // Parse MoE hyperparameters from metadata
         model->n_experts         = get_u32_multi(gctx, "expert_count", 0, false);
         model->n_experts_per_tok = get_u32_multi(gctx, "expert_used_count", 0, false);

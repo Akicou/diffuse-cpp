@@ -68,11 +68,6 @@ std::vector<int32_t> diffuse_sample(
     const int mask_id = hp.mask_token_id;
     const int n_vocab = hp.n_vocab;
 
-    // Dream (Qwen2.5 backbone) uses shifted logits: output at position i
-    // predicts token at position i+1 (autoregressive convention).
-    // To get logits for position i, read from position max(i-1, 0).
-    const bool shift_logits = (ctx->model->model_type == "dream");
-
     // Build initial sequence: prompt + MASK tokens
     std::vector<int32_t> seq = prompt_tokens;
     int prompt_len = (int)prompt_tokens.size();
@@ -140,25 +135,15 @@ std::vector<int32_t> diffuse_sample(
         int n_active = 0;
         bool used_cache = false;
 
-        // Force full forward on step 0, when cache disabled, or at refresh intervals
-        bool force_full = !use_cache || !cache.initialized ||
-                          (cache_refresh > 0 && step > 0 && (step % cache_refresh == 0)) ||
-                          (ctx->model->model_type == "llada2_moe");  // MoE: no cached forward yet
+        // MoE models always use full forward (no partial cached forward)
+        bool force_full = true;
 
         if (force_full) {
             // ── Full forward (step 0, refresh, or cache disabled) ─
-            if (ctx->model->model_type == "llada2_moe") {
-                if (!diffuse_forward_moe_full(ctx, seq.data(), total_len,
-                                              logits_full.data(),
-                                              use_cache ? &cache : nullptr)) {
-                    DIFFUSE_DIE("forward pass failed at step %d", step);
-                }
-            } else {
-                if (!diffuse_forward_full(ctx, seq.data(), total_len,
+            if (!diffuse_forward_moe_full(ctx, seq.data(), total_len,
                                           logits_full.data(),
                                           use_cache ? &cache : nullptr)) {
-                    DIFFUSE_DIE("forward pass failed at step %d", step);
-                }
+                DIFFUSE_DIE("forward pass failed at step %d", step);
             }
             if (use_cache) cache.update_seq(seq.data(), total_len);
             logit_source = logits_full.data();
@@ -173,7 +158,7 @@ std::vector<int32_t> diffuse_sample(
 
             if (n_active >= total_len || n_active == 0) {
                 // Edge case: all active or none → full forward
-                if (!diffuse_forward_full(ctx, seq.data(), total_len,
+                if (!diffuse_forward_moe_full(ctx, seq.data(), total_len,
                                           logits_full.data(), &cache)) {
                     DIFFUSE_DIE("forward pass failed at step %d", step);
                 }
@@ -193,11 +178,11 @@ std::vector<int32_t> diffuse_sample(
                 // Allocate logits for active positions only
                 std::vector<float> logits_active(n_active * n_vocab);
 
-                if (!diffuse_forward_cached(
-                        ctx, active_tokens.data(), active_pos_idx.data(),
-                        n_active, total_len, &cache,
-                        cached_positions, active_positions,
-                        logits_active.data())) {
+                // MoE models always use full forward (no cached path available)
+                // This branch is reached for cache_refresh intervals with dense models,
+                // but since we only support MoE, fall through to full forward.
+                if (!diffuse_forward_moe_full(ctx, seq.data(), total_len,
+                                              logits_full.data(), &cache)) {
                     DIFFUSE_DIE("cached forward failed at step %d", step);
                 }
                 cache.update_seq(seq.data(), total_len);
@@ -240,9 +225,7 @@ std::vector<int32_t> diffuse_sample(
         for (int i = 0; i < total_len; i++) {
             if (!is_masked[i]) continue;
 
-            // Dream: shifted logits (position i uses logits from position max(i-1, 0))
-            int logit_pos = shift_logits ? std::max(i - 1, 0) : i;
-            const float * logit_row = logit_source + (size_t)logit_pos * n_vocab;
+            const float * logit_row = logit_source + (size_t)i * n_vocab;
             float ent = compute_entropy(logit_row, n_vocab);
 
             if (params.temperature <= 0.0f) {

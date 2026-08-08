@@ -94,69 +94,33 @@ std::vector<int32_t> diffuse_generate(
     diffuse_step_callback callback = nullptr);
 
 // ═══════════════════════════════════════════════════════════════
-// ── Autoregressive API ────────────────────────────────────────
+// ── Tokenizer API ─────────────────────────────────────────────
 // ═══════════════════════════════════════════════════════════════
 
-// ── AR sampler parameters ─────────────────────────────────────
-struct ar_sampler_params {
-    float    temperature    = 0.0f;   // 0 = greedy/argmax
-    float    top_p          = 0.9f;   // nucleus sampling
-    int      top_k          = 40;     // top-k (0 = disabled)
-    float    repeat_penalty = 1.1f;   // repetition penalty
-    int      repeat_last_n  = 64;     // window for repeat penalty
-    uint32_t seed           = 42;
-    int      layer_skip     = 0;      // skip N least important layers (0 = disabled)
-    int      sliding_window = 0;      // attend last W positions only (0 = full)
-};
+struct diffuse_tokenizer;
 
-// ── AR token callback (return false to stop) ──────────────────
-using ar_token_callback = std::function<bool(int32_t token, int pos)>;
+// Load tokenizer from a GGUF file (returns nullptr if no tokenizer found)
+diffuse_tokenizer * diffuse_tokenizer_load(const std::string & gguf_path);
 
-// ── AR generation ─────────────────────────────────────────────
-std::vector<int32_t> ar_generate(
-    diffuse_context * ctx,
-    const std::vector<int32_t> & prompt_tokens,
-    int max_tokens,
-    const ar_sampler_params & params,
-    ar_token_callback callback = nullptr);
+// Free a tokenizer
+void diffuse_tokenizer_free(diffuse_tokenizer * tok);
 
-// ═══════════════════════════════════════════════════════════════
-// ── Speculative Decoding API ────────────────────────────────────
-// ═══════════════════════════════════════════════════════════════
+// Encode text → token IDs
+std::vector<int32_t> diffuse_tokenize(
+    diffuse_tokenizer * tok,
+    const std::string & text,
+    bool add_special = true);
 
-struct ar_spec_params {
-    int K = 5;              // speculative lookahead (draft tokens per round)
-    int layer_skip = 0;     // skip N least important target layers (0 = disabled)
-    int sliding_window = 0; // attend last W positions only (0 = full)
-};
+// Decode token IDs → text
+std::string diffuse_detokenize(
+    diffuse_tokenizer * tok,
+    const std::vector<int32_t> & ids,
+    bool skip_special = true);
 
-struct ar_spec_stats {
-    int total_draft_tokens  = 0;
-    int total_accepted      = 0;
-    int total_generated     = 0;
-    int total_target_batches = 0;
-    int total_target_decodes = 0;
-    int total_fast_rejects   = 0;
-    double prefill_ms = 0;
-    double decode_ms  = 0;
+// Check if tokenizer was successfully loaded
+bool diffuse_tokenizer_ready(const diffuse_tokenizer * tok);
 
-    float acceptance_rate() const {
-        return total_draft_tokens > 0
-            ? (float)total_accepted / total_draft_tokens : 0.0f;
-    }
-    float tokens_per_target_call() const {
-        int calls = total_target_batches + total_target_decodes;
-        return calls > 0 ? (float)total_generated / calls : 1.0f;
-    }
-};
-
-std::vector<int32_t> ar_speculative_generate(
-    diffuse_context * target_ctx,
-    diffuse_context * draft_ctx,
-    const std::vector<int32_t> & prompt_tokens,
-    int max_tokens,
-    const ar_spec_params & params,
-    ar_token_callback callback = nullptr,
-    ar_spec_stats * stats_out = nullptr);
+// Get tokenizer vocab size
+size_t diffuse_tokenizer_size(const diffuse_tokenizer * tok);
 
 // end of diffuse.h
