@@ -14,6 +14,7 @@ static void print_usage(const char * prog) {
     fprintf(stderr, "  -n INT      Tokens to generate (default: 128)\n");
     fprintf(stderr, "  -s INT      Diffusion steps (default: 32)\n");
     fprintf(stderr, "  -t INT      Threads (default: 4)\n");
+    fprintf(stderr, "  -ngl INT    GPU layers to offload (default: 0 = CPU only)\n");
     fprintf(stderr, "  --temp F    Temperature (default: 0 = argmax)\n");
     fprintf(stderr, "  --seed INT  Random seed (default: 42)\n");
     fprintf(stderr, "  --schedule  cosine|linear (default: cosine)\n");
@@ -44,6 +45,7 @@ int main(int argc, char ** argv) {
     int n_generate = 128;
     int n_steps    = 32;
     int n_threads  = 4;
+    int n_gpu_layers = 0;
     float temperature = 0.0f;
     float entropy_threshold = 1.5f;
     uint32_t seed  = 42;
@@ -64,6 +66,8 @@ int main(int argc, char ** argv) {
             n_steps = atoi(argv[++i]);
         } else if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) {
             n_threads = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "-ngl") == 0 && i + 1 < argc) {
+            n_gpu_layers = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--temp") == 0 && i + 1 < argc) {
             temperature = atof(argv[++i]);
         } else if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc) {
@@ -123,7 +127,7 @@ int main(int argc, char ** argv) {
 
     const auto & hp = diffuse_model_hparams(model);
     int n_ctx = (int)input_tokens.size() + n_generate;
-    diffuse_context * ctx = diffuse_context_new(model, n_ctx, n_threads);
+    diffuse_context * ctx = diffuse_context_new_gpu(model, n_ctx, n_threads, n_gpu_layers);
 
     // Setup sampler params
     diffuse_sampler_params sparams;

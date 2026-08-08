@@ -60,6 +60,7 @@ struct diffuse_params {
     std::string prompt;
     int         n_generate  = 128;  // tokens to generate
     int         n_threads   = 4;
+    int         n_gpu_layers = 0;   // layers to offload to GPU (0 = CPU only)
     diffuse_sampler_params sampler;
 };
 
@@ -74,6 +75,8 @@ const diffuse_hparams & diffuse_model_hparams(const diffuse_model * model);
 
 // ── Context (holds compute buffers) ────────────────────────────
 diffuse_context * diffuse_context_new(const diffuse_model * model, int n_ctx, int n_threads);
+// Create context with GPU offload: n_gpu_layers layers on GPU (0 = CPU only)
+diffuse_context * diffuse_context_new_gpu(const diffuse_model * model, int n_ctx, int n_threads, int n_gpu_layers);
 void              diffuse_context_free(diffuse_context * ctx);
 
 // ── Forward pass ───────────────────────────────────────────────

@@ -54,6 +54,7 @@ int main(int argc, char ** argv) {
     std::vector<int> threads_list = {1, 4, 12};
     int n_reps = 3;
     int n_warmup = 1;
+    int n_gpu_layers = 0;
     bool json_output = false;
     float entropy_threshold = 1.5f;
     int prompt_len = 32;  // for dummy prompt if --tokens not given
@@ -71,6 +72,8 @@ int main(int argc, char ** argv) {
             threads_list = parse_int_list(argv[++i]);
         } else if (strcmp(argv[i], "-r") == 0 && i + 1 < argc) {
             n_reps = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "-ngl") == 0 && i + 1 < argc) {
+            n_gpu_layers = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--warmup") == 0 && i + 1 < argc) {
             n_warmup = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--json") == 0) {
@@ -150,7 +153,7 @@ int main(int argc, char ** argv) {
                         schedulers[si].name, n_steps, n_threads);
                 fflush(stderr);
 
-                diffuse_context * ctx = diffuse_context_new(model, n_ctx, n_threads);
+                diffuse_context * ctx = diffuse_context_new_gpu(model, n_ctx, n_threads, n_gpu_layers);
 
                 diffuse_sampler_params sparams;
                 sparams.n_steps = n_steps;

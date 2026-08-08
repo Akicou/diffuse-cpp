@@ -1,4 +1,5 @@
 #include "diffuse-graph.h"
+#include "diffuse-backend.h"
 #include "diffuse-cache.h"
 
 #include <algorithm>
@@ -309,9 +310,8 @@ bool diffuse_forward_moe_full(diffuse_context * ctx,
 
     struct ggml_cgraph * gf = diffuse_build_graph_moe(ctx, ctx_compute, tokens, n_tokens);
 
-    enum ggml_status status = ggml_graph_compute_with_ctx(ctx_compute, gf, ctx->n_threads);
-    if (status != GGML_STATUS_SUCCESS) {
-        DIFFUSE_LOG("MoE graph compute failed with status %d", (int)status);
+    if (!diffuse_sched_compute(ctx, ctx_compute, gf)) {
+        DIFFUSE_LOG("MoE graph compute failed");
         ggml_free(ctx_compute);
         return false;
     }

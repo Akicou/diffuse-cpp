@@ -132,12 +132,24 @@ struct diffuse_context {
     const diffuse_model * model;
     int n_ctx;
     int n_threads;
+    int n_gpu_layers = 0;       // number of layers to offload to GPU
 
-    ggml_backend_t        backend = nullptr;
-    ggml_backend_buffer_t buf     = nullptr;
-    struct ggml_context  * ctx    = nullptr;     // compute context
+    // ── Backend scheduler infrastructure ───────────────────────
+    // The scheduler routes graph operations to the best available
+    // backend (CPU, GPU). Replaces the legacy ggml_graph_compute_with_ctx.
+    ggml_backend_t        backend_cpu  = nullptr;
+    ggml_backend_t        backend_gpu  = nullptr;
+    ggml_backend_sched_t  sched        = nullptr;
+    int                   n_backends   = 0;
 
-    // Persistent compute buffer (avoids alloc/free every forward pass)
+    // Compute resources
+    ggml_backend_buffer_t buf          = nullptr;
+    struct ggml_context  * ctx         = nullptr;
+
+    // Legacy persistent compute buffer (used when no GPU backend)
     void  * compute_buf     = nullptr;
     size_t compute_buf_size = 0;
+
+    // Whether the scheduler has been initialized for the current graph topology
+    bool sched_initialized = false;
 };

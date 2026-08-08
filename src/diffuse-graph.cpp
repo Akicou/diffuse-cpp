@@ -1,4 +1,5 @@
 #include "diffuse-graph.h"
+#include "diffuse-backend.h"
 
 // ── Helper: ensure tensor is F32 (for bias add after quantization) ──
 static struct ggml_tensor * ensure_f32(struct ggml_context * ctx, struct ggml_tensor * t) {
@@ -316,9 +317,8 @@ bool diffuse_forward_full(diffuse_context * ctx,
         ? diffuse_build_graph_extractable(ctx, ctx_compute, tokens, n_tokens)
         : diffuse_build_graph(ctx, ctx_compute, tokens, n_tokens);
 
-    enum ggml_status status = ggml_graph_compute_with_ctx(ctx_compute, gf, ctx->n_threads);
-    if (status != GGML_STATUS_SUCCESS) {
-        DIFFUSE_LOG("graph compute failed with status %d", (int)status);
+    if (!diffuse_sched_compute(ctx, ctx_compute, gf)) {
+        DIFFUSE_LOG("graph compute failed");
         ggml_free(ctx_compute);
         return false;
     }
@@ -584,9 +584,8 @@ bool diffuse_forward_cached(
             n_active, n_total,
             cache, cached_positions);
 
-    enum ggml_status status = ggml_graph_compute_with_ctx(ctx_compute, gf, ctx->n_threads);
-    if (status != GGML_STATUS_SUCCESS) {
-        DIFFUSE_LOG("cached graph compute failed with status %d", (int)status);
+    if (!diffuse_sched_compute(ctx, ctx_compute, gf)) {
+        DIFFUSE_LOG("cached graph compute failed");
         ggml_free(ctx_compute);
         return false;
     }
@@ -702,26 +701,38 @@ struct ggml_context * diffuse_new_compute_ctx(diffuse_context * dctx, size_t nee
 
 // ── Context management ─────────────────────────────────────────
 diffuse_context * diffuse_context_new(const diffuse_model * model, int n_ctx, int n_threads) {
-    auto * ctx = new diffuse_context();
-    ctx->model     = model;
-    ctx->n_ctx     = n_ctx;
-    ctx->n_threads = n_threads;
+    return diffuse_context_new_gpu(model, n_ctx, n_threads, 0);
+}
 
-    // Pre-allocate compute buffer for the maximum expected sequence length.
-    // This avoids multi-GB malloc/free on every diffusion step.
-    // (Inspired by llama.cpp's compute buffer persistence pattern.)
-    const auto & hp = model->hparams;
-    size_t max_tokens = (size_t)n_ctx + 256;  // prompt + generation tokens
-    size_t needed = diffuse_compute_buf_size(hp, (int)max_tokens);
-    diffuse_ensure_compute_buf(ctx, needed);
+diffuse_context * diffuse_context_new_gpu(const diffuse_model * model, int n_ctx, int n_threads, int n_gpu_layers) {
+    auto * ctx = new diffuse_context();
+    ctx->model       = model;
+    ctx->n_ctx       = n_ctx;
+    ctx->n_threads   = n_threads;
+    ctx->n_gpu_layers = n_gpu_layers;
+
+    // Initialize backends (CPU always, GPU if requested)
+    diffuse_init_backends(ctx, n_gpu_layers);
+
+    // Pre-allocate compute buffer for CPU-only fallback path.
+    // When GPU backend is active, the scheduler manages its own buffers.
+    if (n_gpu_layers == 0) {
+        const auto & hp = model->hparams;
+        size_t max_tokens = (size_t)n_ctx + 256;
+        size_t needed = diffuse_compute_buf_size(hp, (int)max_tokens);
+        diffuse_ensure_compute_buf(ctx, needed);
+    }
 
     return ctx;
 }
 
 void diffuse_context_free(diffuse_context * ctx) {
     if (!ctx) return;
-    if (ctx->buf) ggml_backend_buffer_free(ctx->buf);
-    if (ctx->ctx) ggml_free(ctx->ctx);
+    if (ctx->sched)      ggml_backend_sched_free(ctx->sched);
+    if (ctx->buf)        ggml_backend_buffer_free(ctx->buf);
+    if (ctx->backend_gpu) ggml_backend_free(ctx->backend_gpu);
+    if (ctx->backend_cpu) ggml_backend_free(ctx->backend_cpu);
+    if (ctx->ctx)        ggml_free(ctx->ctx);
     if (ctx->compute_buf) free(ctx->compute_buf);
     delete ctx;
 }
