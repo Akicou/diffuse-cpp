@@ -10,7 +10,8 @@ High-performance C++ inference engine for Diffusion Language Models, built on GG
 
 ## Highlights
 
-- **Two models**: LLaDA-8B (Llama backbone) and Dream-7B (Qwen2.5 backbone, GQA)
+- **Three models**: LLaDA-8B, Dream-7B, and LLaDA2.2-flash MoE (150B, 13B active)
+- **GPU acceleration** via Vulkan (cross-vendor), CUDA (NVIDIA), or HIP (AMD ROCm)
 - **14–28 tok/s on easy prompts** with Q4_K_M + entropy_exit + inter-step cache
 - **Up to 3.3x faster than llama.cpp** (8.51 tok/s) on the same hardware
 - **Inter-step KV cache**: 1.6–1.8x average speedup with no quality degradation
@@ -77,6 +78,107 @@ All benchmarks: AMD EPYC 4465P 12-Core, 125GB RAM, Q4_K_M, entropy_exit + inter-
 *Cache gives 1.6x average speedup (9.6 → 15.3 tok/s). 6 of 8 prompts outperform llama.cpp.*
 
 ### Quantization Performance (steps=16, threads=12, B=64)
+
+| Model | Size | low_confidence | Speedup vs F16 |
+|-------|------|----------------|-----------------|
+| F16 | 14.9 GB | 1.64 tok/s | 1.00x |
+| Q8_0 | 8.4 GB | 1.84 | 1.12x |
+| Q4_K_M | 5.1 GB | 2.52 | **1.54x** |
+
+### Thread Scaling (Q4_K_M, steps=16)
+
+| Threads | low_confidence | Scaling |
+|---------|---------------|---------|
+| 1 | 0.34 tok/s | 1.0x |
+| 4 | 1.18 | 3.5x |
+| 12 | 2.52 | 7.5x |
+| 24 | 2.21 | 6.6x |
+
+## Quick Start
+
+### Build
+
+#### CPU-only (works everywhere)
+
+```bash
+git clone --recursive https://github.com/iafiscal1212/diffuse-cpp.git
+cd diffuse-cpp
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j$(nproc)
+```
+
+#### With GPU acceleration
+
+Pick the backend that matches your hardware:
+
+| Your GPU | Backend | Prerequisites | CMake Flag |
+|----------|---------|---------------|------------|
+| NVIDIA | CUDA | [CUDA Toolkit](https://developer.nvidia.com/cuda-toolkit) 12+ | `-DDIFFUSE_CUDA=ON` |
+| AMD | Vulkan | [Vulkan SDK](https://vulkan.lunarg.com/) | `-DDIFFUSE_VULKAN=ON` |
+| AMD (Linux) | HIP/ROCm | [ROCm](https://rocm.docs.amd.com/) 5.7+ | `-DDIFFUSE_HIP=ON` |
+| Intel | Vulkan | [Vulkan SDK](https://vulkan.lunarg.com/) | `-DDIFFUSE_VULKAN=ON` |
+| Any / iGPU | Vulkan | [Vulkan SDK](https://vulkan.lunarg.com/) | `-DDIFFUSE_VULKAN=ON` |
+
+**Vulkan** (recommended for AMD, Intel, and APUs like AMD Strix Halo):
+
+```bash
+# Linux / macOS
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DDIFFUSE_VULKAN=ON
+cmake --build build -j$(nproc)
+
+# Windows (Visual Studio)
+cmake -B build -G "Visual Studio 17 2022" -A x64 -DDIFFUSE_VULKAN=ON
+cmake --build build --config Release
+```
+
+**CUDA** (NVIDIA):
+
+```bash
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DDIFFUSE_CUDA=ON
+cmake --build build -j$(nproc)
+```
+
+**HIP / ROCm** (AMD, Linux only):
+
+```bash
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DDIFFUSE_HIP=ON
+cmake --build build -j$(nproc)
+```
+
+> **No GPU?** The default build is CPU-only and works out of the box.
+> The GPU flag is only needed if you want to offload layers with `-ngl`.
+
+### Basic Usage
+
+```bash
+# CPU-only generation
+./build/diffuse-cli \
+    -m model.gguf \
+    --tokens "128000,3923,374,279,6864,315,9822,30" \
+    -n 256 -s 16 -t 12 \
+    --remasking entropy_exit
+
+# With GPU offload (offload 32 layers to GPU)
+./build/diffuse-cli \
+    -m model.gguf \
+    --tokens "128000,3923,374,279,6864,315,9822,30" \
+    -n 256 -s 16 -t 4 -ngl 32 \
+    --remasking entropy_exit
+```
+
+> If you pass `-ngl > 0` but no GPU backend is compiled in, the engine
+> prints a warning and falls back to CPU automatically.
+
+**Note**: diffuse-cpp operates on token IDs, not raw text. Use the HuggingFace transformers library to tokenize your prompts:
+
+```python
+from transformers import AutoTokenizer
+tokenizer = AutoTokenizer.from_pretrained("LLaDA-8B-Instruct")
+tokens = tokenizer.encode("What is the capital of France?")
+print(",".join(map(str, tokens)))
+```
+
+## Quantization Performance (steps=16, threads=12, B=64)
 
 | Model | Size | low_confidence | Speedup vs F16 |
 |-------|------|----------------|-----------------|
@@ -239,25 +341,80 @@ The cache acts as implicit regularization: reusing stable K,V from previous step
 - C++17 compiler (GCC 8+, Clang 7+, MSVC 2019+)
 - CMake 3.14+
 - Git (for GGML submodule)
+- *(Optional)* [Vulkan SDK](https://vulkan.lunarg.com/) for GPU acceleration (AMD, Intel, or any APU)
+- *(Optional)* [CUDA Toolkit](https://developer.nvidia.com/cuda-toolkit) 12+ for NVIDIA GPUs
+- *(Optional)* [ROCm](https://rocm.docs.amd.com/) 5.7+ for AMD GPUs on Linux
 
 ### Full Build
 
+#### Linux (CPU + optional GPU)
+
 ```bash
-git clone --recursive https://github.com/iafiscal1212/diffuse-cpp.git
+git clone --recursive https://github.com/Akicou/diffuse-cpp.git
 cd diffuse-cpp
 
-# Release build (optimized)
+# CPU-only (works everywhere)
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)
 
-# Tools (CLI, bench, quantize) are built by default
-# To disable: -DDIFFUSE_BUILD_TOOLS=OFF
+# With AMD/Intel GPU (Vulkan)
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DDIFFUSE_VULKAN=ON
+cmake --build build -j$(nproc)
+
+# With NVIDIA GPU (CUDA)
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DDIFFUSE_CUDA=ON
+cmake --build build -j$(nproc)
+
+# With AMD GPU (ROCm/HIP — Linux only)
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DDIFFUSE_HIP=ON
+cmake --build build -j$(nproc)
 ```
 
+#### Windows (Visual Studio 2022)
+
+```powershell
+git clone --recursive https://github.com/Akicou/diffuse-cpp.git
+cd diffuse-cpp
+
+# CPU-only
+cmake -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release
+
+# With GPU (Vulkan — works with NVIDIA, AMD, and Intel on Windows)
+cmake -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=Release -DDIFFUSE_VULKAN=ON
+cmake --build build --config Release
+
+# With GPU (CUDA — NVIDIA only)
+cmake -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=Release -DDIFFUSE_CUDA=ON
+cmake --build build --config Release
+```
+
+#### macOS (Apple Silicon — CPU only)
+
+```bash
+git clone --recursive https://github.com/Akicou/diffuse-cpp.git
+cd diffuse-cpp
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j$(sysctl -n hw.ncpu)
+```
+
+> **Tip**: To disable tools (CLI, bench) and build just the library:
+> `-DDIFFUSE_BUILD_TOOLS=OFF`
+
 Binaries:
-- `build/diffuse-cli`: command-line inference
+- `build/diffuse-cli` (Linux/macOS) or `build/Release/diffuse-cli.exe` (Windows): command-line inference
 - `build/diffuse-quantize`: model quantization
 - `build/diffuse-bench`: benchmarking
+
+### Build Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `DIFFUSE_BUILD_TOOLS` | `ON` | Build CLI tools (diffuse-cli, diffuse-bench, diffuse-quantize) |
+| `DIFFUSE_BUILD_TESTS` | `ON` | Build test suite |
+| `DIFFUSE_VULKAN` | `OFF` | Enable Vulkan GPU backend (cross-vendor) |
+| `DIFFUSE_CUDA` | `OFF` | Enable CUDA GPU backend (NVIDIA) |
+| `DIFFUSE_HIP` | `OFF` | Enable HIP/ROCm GPU backend (AMD, Linux) |
 
 ## API
 
@@ -270,7 +427,11 @@ diffuse-cpp provides a C++ API for embedding in other applications:
 diffuse_model* model = diffuse_model_load("model.gguf", 12);
 
 // Create context
+// Create context (CPU-only)
 diffuse_context* ctx = diffuse_context_new(model, 128, 12);
+
+// Or with GPU offload (offload 32 layers):
+// diffuse_context* ctx = diffuse_context_new_gpu(model, 128, 12, 32);
 
 // Configure sampler
 diffuse_sampler_params params;
@@ -297,6 +458,7 @@ See `include/diffuse.h` for full API documentation.
 4. **Thread count**: optimal = physical cores (hyperthreading reduces performance)
 5. **Steps**: start with 16, reduce to 8 if quality is acceptable
 6. **Entropy threshold**: 1.5 is a good default; increase to 2.0 for more aggressive early exit
+7. **GPU offload** (`-ngl`): offload layers to GPU for significant speedup on large models. Use `-ngl 99` to offload everything. Requires building with a GPU backend (Vulkan/CUDA/HIP).
 
 ## Project Status
 
@@ -308,7 +470,7 @@ Current limitations:
 - No integrated tokenizer (use transformers)
 - Default 256 generated tokens per call (configurable via -n flag)
 - Single-model inference only (no batching)
-- CPU-only (GPU support via GGML is possible but not prioritized)
+- GPU offload available via Vulkan/CUDA/HIP backends (build with `-DDIFFUSE_VULKAN=ON` etc.)
 
 ## Contributing
 
@@ -318,7 +480,7 @@ Contributions welcome! This is the only C++ inference engine for diffusion LLMs 
 - Additional masked diffusion model architectures
 - Integrated tokenizer (eliminate the Python pre-tokenization step)
 - Batched inference for serving workloads
-- GPU offloading via GGML (Metal, Vulkan, CUDA)
+- Metal backend for Apple Silicon GPUs
 - Improved scheduling heuristics
 - Benchmarks on different hardware (Intel, ARM, Apple Silicon)
 
