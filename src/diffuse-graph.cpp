@@ -642,10 +642,13 @@ static size_t diffuse_compute_buf_size(const diffuse_hparams & hp, int n_tokens)
     const size_t n_layer = hp.n_layer;
 
     // Per layer: QKV projections, attention intermediates, norms, FFN
+    // Note: flash attention avoids the N*N*H attention matrix, so we
+    // only need O(N*d) for attention instead of O(N^2*H).
+    // The terms below over-estimate slightly to stay safe.
     size_t per_layer =
         (size_t)n_tokens * n_embd * sizeof(float) * 10     // QKV proj + norms + residuals
       + (size_t)n_tokens * n_ff   * sizeof(float) * 3      // FFN (gate, up, down, intermediate)
-      + (size_t)n_tokens * n_tokens * n_head * sizeof(float) * 2  // attention matrix (for non-flash path fallback)
+      + (size_t)n_tokens * n_embd * sizeof(float) * 2      // attention (Q,K,V + output) — flash path
       + n_embd * sizeof(float) * 2                          // norm weights
       ;
 
