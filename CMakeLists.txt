@@ -16,7 +16,7 @@ set(GGML_OPENMP ON CACHE BOOL "" FORCE)
 add_subdirectory(ggml)
 
 # ── Core library (diffusion + autoregressive) ─────────────────
-add_library(diffuse
+add_library(diffuse STATIC
     src/diffuse-model.cpp
     src/diffuse-graph.cpp
     src/diffuse-sampler.cpp

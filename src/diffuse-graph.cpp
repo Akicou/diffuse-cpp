@@ -7,6 +7,12 @@ static struct ggml_tensor * ensure_f32(struct ggml_context * ctx, struct ggml_te
     return t;
 }
 
+// ── Forward declarations for persistent compute buffer helpers ──
+// (defined after the graph builders; used by diffuse_forward_full/cached)
+static size_t diffuse_compute_buf_size(const diffuse_hparams & hp, int n_tokens);
+static void   diffuse_ensure_compute_buf(diffuse_context * dctx, size_t needed);
+static struct ggml_context * diffuse_new_compute_ctx(diffuse_context * dctx, size_t needed);
+
 // ── Build transformer forward graph ────────────────────────────
 struct ggml_cgraph * diffuse_build_graph(
         diffuse_context * dctx,
@@ -78,44 +84,37 @@ struct ggml_cgraph * diffuse_build_graph(
         K = ggml_rope_ext(ctx, K, inp_pos, nullptr, n_embd_head,
                           GGML_ROPE_TYPE_NEOX, 0, hp.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
 
-        // GQA: repeat each KV head n_rep times (grouped, not interleaved)
-        // Reshape 3D→4D so ggml_repeat expands the right axis, then flatten back.
-        // K[d, n_kv, N] → K[d, 1, n_kv, N] → repeat → K[d, n_rep, n_kv, N] → K[d, n_head, N]
-        if (n_head_kv < n_head) {
-            const int n_rep = n_head / n_head_kv;
-            K = ggml_reshape_4d(ctx, K, n_embd_head, 1, n_head_kv, N);
-            K = ggml_repeat(ctx, K,
-                    ggml_new_tensor_4d(ctx, K->type, n_embd_head, n_rep, n_head_kv, N));
-            K = ggml_reshape_3d(ctx, K, n_embd_head, n_head, N);
+        // ── Flash Attention (fused bidirectional attention) ──────
+        // Replaces the manual K^T@Q → scale → softmax → V^T@attn path.
+        // Adopted from llama.cpp's build_attn() which uses ggml_flash_attn_ext
+        // for diffusion models (LLaDA, Dream) with non-causal attention.
+        //
+        // Key advantages over the old manual attention:
+        //   1. Avoids materializing the N×N×n_head attention matrix
+        //   2. Handles GQA natively — no need to expand K,V from n_head_kv to n_head
+        //   3. mask=nullptr → no masking = full bidirectional attention
+        //
+        // flash_attn_ext expects:
+        //   Q: [n_embd_head, N, n_head,    1]
+        //   K: [n_embd_head, N, n_head_kv, 1]  (GQA broadcast handled by kernel)
+        //   V: [n_embd_head, N, n_head_kv, 1]  (same layout as K, contiguous)
+        //   mask: nullptr (bidirectional — all positions attend to all)
+        //   result: [n_embd_head, n_head, N, 1] → reshape to [n_embd, N]
+        //
+        // No GQA expansion needed — flash_attn_ext broadcasts n_head_kv → n_head.
 
-            V = ggml_reshape_4d(ctx, V, n_embd_head, 1, n_head_kv, N);
-            V = ggml_repeat(ctx, V,
-                    ggml_new_tensor_4d(ctx, V->type, n_embd_head, n_rep, n_head_kv, N));
-            V = ggml_reshape_3d(ctx, V, n_embd_head, n_head, N);
-        }
-
-        // Permute Q, K: [n_embd_head, n_head, N] → [n_embd_head, N, n_head]
-        // ggml_permute semantics: result->ne[axis_i] = input->ne[i]
+        // Q: [n_embd_head, n_head, N] → [n_embd_head, N, n_head]
         Q = ggml_permute(ctx, Q, 0, 2, 1, 3);
+        // K,V: [n_embd_head, n_head_kv, N] → [n_embd_head, N, n_head_kv]
         K = ggml_permute(ctx, K, 0, 2, 1, 3);
+        V = ggml_cont(ctx, ggml_permute(ctx, V, 0, 2, 1, 3));
 
-        // V: [n_embd_head, n_head, N] → [N, n_embd_head, n_head] (contiguous)
-        // Input dim 0→result dim 1, dim 1→result dim 2, dim 2→result dim 0
-        V = ggml_cont(ctx, ggml_permute(ctx, V, 1, 2, 0, 3));
+        float attn_scale = 1.0f / sqrtf((float)n_embd_head);
+        struct ggml_tensor * attn_out = ggml_flash_attn_ext(
+                ctx, Q, K, V, nullptr, attn_scale, 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_prec(attn_out, GGML_PREC_F32);
 
-        // Attention: K^T @ Q → [N, N, n_head]
-        struct ggml_tensor * attn = ggml_mul_mat(ctx, K, Q);
-        attn = ggml_scale(ctx, attn, 1.0f / sqrtf((float)n_embd_head));
-
-        // BIDIRECTIONAL: no causal mask
-        attn = ggml_soft_max(ctx, attn);
-
-        // Weighted sum: V^T @ attn → [n_embd_head, N, n_head]
-        struct ggml_tensor * attn_out = ggml_mul_mat(ctx, V, attn);
-
-        // Merge heads: [n_embd_head, N, n_head] → [n_embd_head, n_head, N] → [n_embd, N]
-        attn_out = ggml_permute(ctx, attn_out, 0, 2, 1, 3);
-        attn_out = ggml_cont(ctx, attn_out);
+        // Result: [n_embd_head, n_head, N, 1] → [n_embd, N]
         attn_out = ggml_reshape_2d(ctx, attn_out, n_embd, N);
 
         // Output projection
@@ -254,18 +253,17 @@ static struct ggml_cgraph * diffuse_build_graph_extractable(
             ggml_set_output(V);
         }
 
-        // Permute for attention (same as original)
-        Q = ggml_permute(ctx, Q, 0, 2, 1, 3);
-        K = ggml_permute(ctx, K, 0, 2, 1, 3);
-        V = ggml_cont(ctx, ggml_permute(ctx, V, 1, 2, 0, 3));
+        // ── Flash Attention (fused bidirectional) ──────────────
+        // K,V are GQA-expanded here; flash_attn_ext processes them as
+        // n_head==n_head_kv (MHA). Still avoids N×N matrix materialization.
+        Q = ggml_permute(ctx, Q, 0, 2, 1, 3);  // [d, N, n_head]
+        K = ggml_permute(ctx, K, 0, 2, 1, 3);  // [d, N, n_head]
+        V = ggml_cont(ctx, ggml_permute(ctx, V, 0, 2, 1, 3));  // [d, N, n_head]
 
-        struct ggml_tensor * attn = ggml_mul_mat(ctx, K, Q);
-        attn = ggml_scale(ctx, attn, 1.0f / sqrtf((float)n_embd_head));
-        attn = ggml_soft_max(ctx, attn);
-
-        struct ggml_tensor * attn_out = ggml_mul_mat(ctx, V, attn);
-        attn_out = ggml_permute(ctx, attn_out, 0, 2, 1, 3);
-        attn_out = ggml_cont(ctx, attn_out);
+        float attn_scale = 1.0f / sqrtf((float)n_embd_head);
+        struct ggml_tensor * attn_out = ggml_flash_attn_ext(
+                ctx, Q, K, V, nullptr, attn_scale, 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_prec(attn_out, GGML_PREC_F32);
         attn_out = ggml_reshape_2d(ctx, attn_out, n_embd, N);
 
         cur = ggml_mul_mat(ctx, layer.wo, attn_out);
@@ -312,26 +310,9 @@ bool diffuse_forward_full(diffuse_context * ctx,
                           diffuse_step_cache * cache) {
     const auto & hp = ctx->model->hparams;
 
-    // Buffer size: same as original + extra for named K,V output tensors
-    size_t per_layer = (size_t)n_tokens * hp.n_embd * sizeof(float) * 10
-                     + (size_t)n_tokens * hp.n_ff   * sizeof(float) * 3
-                     + (size_t)n_tokens * n_tokens * hp.n_head * sizeof(float) * 2
-                     + hp.n_embd * sizeof(float) * 2;
-    size_t buf_size = per_layer * hp.n_layer;
-    buf_size += (size_t)n_tokens * hp.n_vocab * sizeof(float) * 2;
-    buf_size += 256ull * 1024 * 1024;
-    buf_size = (size_t)(buf_size * 1.5);
-
-    struct ggml_init_params cparams = {
-        /*.mem_size   = */ buf_size,
-        /*.mem_buffer = */ nullptr,
-        /*.no_alloc   = */ false,
-    };
-    struct ggml_context * ctx_compute = ggml_init(cparams);
-    if (!ctx_compute) {
-        DIFFUSE_LOG("failed to allocate compute context (%zu MB)", buf_size / (1024*1024));
-        return false;
-    }
+    // Use persistent compute buffer (avoids multi-GB malloc/free each step)
+    size_t needed = diffuse_compute_buf_size(hp, n_tokens);
+    struct ggml_context * ctx_compute = diffuse_new_compute_ctx(ctx, needed);
 
     struct ggml_cgraph * gf = (cache != nullptr)
         ? diffuse_build_graph_extractable(ctx, ctx_compute, tokens, n_tokens)
@@ -525,31 +506,17 @@ struct ggml_cgraph * diffuse_build_graph_cached(
         struct ggml_tensor * V_full = ggml_concat(ctx, V_cached, V_active, 2);
         // K_full shape: [n_embd_head, n_head, n_total]
 
-        // ── Permute for attention ────────────────────────────────
-        // Q: [n_embd_head, n_head, n_active] → [n_embd_head, n_active, n_head]
+        // ── Flash Attention (fused, with cached K,V) ────────────
+        // Q: [n_embd_head, n_head, n_active] → [d, n_active, n_head]
         Q_active = ggml_permute(ctx, Q_active, 0, 2, 1, 3);
-        // K: [n_embd_head, n_head, n_total] → [n_embd_head, n_total, n_head]
+        // K_full, V_full: [d, n_head, n_total] → [d, n_total, n_head]
         K_full = ggml_permute(ctx, K_full, 0, 2, 1, 3);
-        // V: [n_embd_head, n_head, n_total] → [n_total, n_embd_head, n_head]
-        V_full = ggml_cont(ctx, ggml_permute(ctx, V_full, 1, 2, 0, 3));
+        V_full = ggml_cont(ctx, ggml_permute(ctx, V_full, 0, 2, 1, 3));
 
-        // ── Attention scores: K_full^T @ Q_active ────────────────
-        // K_full: [n_embd_head, n_total, n_head]
-        // Q_active: [n_embd_head, n_active, n_head]
-        // Result: [n_total, n_active, n_head]
-        struct ggml_tensor * attn = ggml_mul_mat(ctx, K_full, Q_active);
-        attn = ggml_scale(ctx, attn, 1.0f / sqrtf((float)n_embd_head));
-        attn = ggml_soft_max(ctx, attn);
-
-        // ── Weighted sum: V_full^T @ attn ────────────────────────
-        // V_full: [n_total, n_embd_head, n_head]
-        // attn: [n_total, n_active, n_head]
-        // Result: [n_embd_head, n_active, n_head]
-        struct ggml_tensor * attn_out = ggml_mul_mat(ctx, V_full, attn);
-
-        // Merge heads: [n_embd_head, n_active, n_head] → [n_embd, n_active]
-        attn_out = ggml_permute(ctx, attn_out, 0, 2, 1, 3);
-        attn_out = ggml_cont(ctx, attn_out);
+        float attn_scale = 1.0f / sqrtf((float)n_embd_head);
+        struct ggml_tensor * attn_out = ggml_flash_attn_ext(
+                ctx, Q_active, K_full, V_full, nullptr, attn_scale, 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_prec(attn_out, GGML_PREC_F32);
         attn_out = ggml_reshape_2d(ctx, attn_out, n_embd, n_active);
 
         // Output projection
@@ -607,27 +574,11 @@ bool diffuse_forward_cached(
     const auto & hp = ctx->model->hparams;
     const int n_cached = n_total - n_active;
 
-    // Compute buffer: sized for active + cached attention
-    size_t per_layer = (size_t)n_active * hp.n_embd * sizeof(float) * 10
-                     + (size_t)n_active * hp.n_ff   * sizeof(float) * 3
-                     + (size_t)n_active * n_total * hp.n_head * sizeof(float) * 2
-                     + (size_t)n_total * hp.n_embd_head() * hp.n_head * sizeof(float) * 4
-                     + hp.n_embd * sizeof(float) * 2;
-    size_t buf_size = per_layer * hp.n_layer;
-    buf_size += (size_t)n_active * hp.n_vocab * sizeof(float) * 2;
-    buf_size += 256ull * 1024 * 1024;
-    buf_size = (size_t)(buf_size * 1.5);
-
-    struct ggml_init_params cparams = {
-        /*.mem_size   = */ buf_size,
-        /*.mem_buffer = */ nullptr,
-        /*.no_alloc   = */ false,
-    };
-    struct ggml_context * ctx_compute = ggml_init(cparams);
-    if (!ctx_compute) {
-        DIFFUSE_LOG("cached: failed to alloc compute ctx (%zu MB)", buf_size / (1024*1024));
-        return false;
-    }
+    // Use persistent compute buffer (reuse across cached steps)
+    // The cached path needs less memory than the full path, so the
+    // pre-allocated buffer from diffuse_context_new will suffice.
+    size_t needed = diffuse_compute_buf_size(hp, std::max(n_total, n_active));
+    struct ggml_context * ctx_compute = diffuse_new_compute_ctx(ctx, needed);
 
     struct ggml_cgraph * gf = diffuse_build_graph_cached(
             ctx, ctx_compute,
@@ -679,12 +630,86 @@ bool diffuse_forward(diffuse_context * ctx,
     return diffuse_forward_full(ctx, tokens, n_tokens, logits_out, nullptr);
 }
 
+// ── Compute buffer sizing ──────────────────────────────────────
+// Estimate the GGML arena needed for one forward pass. The buffer must
+// hold all intermediate tensors for n_layer transformer blocks plus the
+// final logits projection. We size conservatively; the persistent buffer
+// is reused across steps, so over-allocation is one-time.
+static size_t diffuse_compute_buf_size(const diffuse_hparams & hp, int n_tokens) {
+    const size_t n_embd = hp.n_embd;
+    const size_t n_head = hp.n_head;
+    const size_t n_ff   = hp.n_ff;
+    const size_t n_layer = hp.n_layer;
+
+    // Per layer: QKV projections, attention intermediates, norms, FFN
+    size_t per_layer =
+        (size_t)n_tokens * n_embd * sizeof(float) * 10     // QKV proj + norms + residuals
+      + (size_t)n_tokens * n_ff   * sizeof(float) * 3      // FFN (gate, up, down, intermediate)
+      + (size_t)n_tokens * n_tokens * n_head * sizeof(float) * 2  // attention matrix (for non-flash path fallback)
+      + n_embd * sizeof(float) * 2                          // norm weights
+      ;
+
+    size_t buf_size = per_layer * n_layer;
+    buf_size += (size_t)n_tokens * hp.n_vocab * sizeof(float) * 2;  // logits
+    buf_size += 256ull * 1024 * 1024;                               // overhead
+    buf_size = (size_t)(buf_size * 1.5);                            // headroom
+
+    return buf_size;
+}
+
+// ── Allocate or grow the persistent compute buffer ──────────────
+static void diffuse_ensure_compute_buf(diffuse_context * dctx, size_t needed) {
+    if (dctx->compute_buf_size >= needed) return;
+
+    // Free old buffer if present
+    if (dctx->compute_buf) {
+        free(dctx->compute_buf);
+    }
+
+    dctx->compute_buf = malloc(needed);
+    if (!dctx->compute_buf) {
+        DIFFUSE_DIE("failed to allocate compute buffer (%zu MB)", needed / (1024*1024));
+    }
+    dctx->compute_buf_size = needed;
+
+    DIFFUSE_LOG("compute buffer: %zu MB (persistent)", needed / (1024*1024));
+}
+
+// ── Create a GGML context on the persistent buffer ──────────────
+// This re-initializes a fresh GGML arena on top of the pre-allocated
+// memory, effectively "resetting" it for the next graph build. This is
+// the key optimization: we avoid malloc/free of multi-GB buffers on
+// every diffusion step.
+static struct ggml_context * diffuse_new_compute_ctx(diffuse_context * dctx, size_t needed) {
+    diffuse_ensure_compute_buf(dctx, needed);
+
+    struct ggml_init_params cparams = {
+        /*.mem_size   = */ dctx->compute_buf_size,
+        /*.mem_buffer = */ dctx->compute_buf,
+        /*.no_alloc   = */ false,
+    };
+    struct ggml_context * ctx = ggml_init(cparams);
+    if (!ctx) {
+        DIFFUSE_DIE("failed to initialize compute context (%zu MB)", dctx->compute_buf_size / (1024*1024));
+    }
+    return ctx;
+}
+
 // ── Context management ─────────────────────────────────────────
 diffuse_context * diffuse_context_new(const diffuse_model * model, int n_ctx, int n_threads) {
     auto * ctx = new diffuse_context();
     ctx->model     = model;
     ctx->n_ctx     = n_ctx;
     ctx->n_threads = n_threads;
+
+    // Pre-allocate compute buffer for the maximum expected sequence length.
+    // This avoids multi-GB malloc/free on every diffusion step.
+    // (Inspired by llama.cpp's compute buffer persistence pattern.)
+    const auto & hp = model->hparams;
+    size_t max_tokens = (size_t)n_ctx + 256;  // prompt + generation tokens
+    size_t needed = diffuse_compute_buf_size(hp, (int)max_tokens);
+    diffuse_ensure_compute_buf(ctx, needed);
+
     return ctx;
 }
 
@@ -692,5 +717,6 @@ void diffuse_context_free(diffuse_context * ctx) {
     if (!ctx) return;
     if (ctx->buf) ggml_backend_buffer_free(ctx->buf);
     if (ctx->ctx) ggml_free(ctx->ctx);
+    if (ctx->compute_buf) free(ctx->compute_buf);
     delete ctx;
 }

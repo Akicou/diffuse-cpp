@@ -7,6 +7,7 @@
 #include "diffuse.h"
 
 #include <cstdio>
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <vector>

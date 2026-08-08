@@ -141,9 +141,15 @@ int main(int argc, char ** argv) {
 #ifdef _OPENMP
         omp_set_num_threads(n_threads);
 #endif
+#ifdef _WIN32
+        _putenv_s("OMP_PROC_BIND", "close");
+        _putenv_s("OMP_PLACES", "cores");
+        _putenv_s("GOMP_CPU_AFFINITY", "0-1023");
+#else
         setenv("OMP_PROC_BIND", "close", 0);
         setenv("OMP_PLACES", "cores", 0);
         setenv("GOMP_CPU_AFFINITY", "0-1023", 0);
+#endif
         fprintf(stderr, "Thread binding: enabled (%d threads, close/cores)\n", n_threads);
     }
 

@@ -13,6 +13,11 @@
 #include <memory>
 #include <cmath>
 
+// MSVC does not define M_PI by default
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
 // ── Logging ────────────────────────────────────────────────────
 #define DIFFUSE_LOG(fmt, ...) fprintf(stderr, "[diffuse] " fmt "\n", ##__VA_ARGS__)
 #define DIFFUSE_DIE(fmt, ...) do { \
@@ -68,6 +73,14 @@ struct diffuse_model {
 };
 
 // ── Compute context ────────────────────────────────────────────
+//
+// Optimized after studying llama.cpp's compute buffer reuse pattern:
+// llama.cpp pre-allocates compute buffers once in llama_context and reuses
+// them across forward passes via ggml_backend_sched. We achieve a similar
+// effect by caching a raw memory arena and re-initializing a fresh GGML
+// context on top of it for each forward pass — avoiding the malloc/free
+// overhead that the original diffuse-cpp incurred on every diffusion step.
+
 struct diffuse_context {
     const diffuse_model * model;
     int n_ctx;
@@ -76,4 +89,8 @@ struct diffuse_context {
     ggml_backend_t        backend = nullptr;
     ggml_backend_buffer_t buf     = nullptr;
     struct ggml_context  * ctx    = nullptr;     // compute context
+
+    // Persistent compute buffer (avoids alloc/free every forward pass)
+    void  * compute_buf     = nullptr;
+    size_t compute_buf_size = 0;
 };
