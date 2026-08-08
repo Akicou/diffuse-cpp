@@ -19,6 +19,7 @@ add_subdirectory(ggml)
 add_library(diffuse STATIC
     src/diffuse-model.cpp
     src/diffuse-graph.cpp
+    src/diffuse-moe-graph.cpp
     src/diffuse-sampler.cpp
     src/ar-graph.cpp
     src/ar-sampler.cpp

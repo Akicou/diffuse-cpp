@@ -142,14 +142,23 @@ std::vector<int32_t> diffuse_sample(
 
         // Force full forward on step 0, when cache disabled, or at refresh intervals
         bool force_full = !use_cache || !cache.initialized ||
-                          (cache_refresh > 0 && step > 0 && (step % cache_refresh == 0));
+                          (cache_refresh > 0 && step > 0 && (step % cache_refresh == 0)) ||
+                          (ctx->model->model_type == "llada2_moe");  // MoE: no cached forward yet
 
         if (force_full) {
             // ── Full forward (step 0, refresh, or cache disabled) ─
-            if (!diffuse_forward_full(ctx, seq.data(), total_len,
-                                      logits_full.data(),
-                                      use_cache ? &cache : nullptr)) {
-                DIFFUSE_DIE("forward pass failed at step %d", step);
+            if (ctx->model->model_type == "llada2_moe") {
+                if (!diffuse_forward_moe_full(ctx, seq.data(), total_len,
+                                              logits_full.data(),
+                                              use_cache ? &cache : nullptr)) {
+                    DIFFUSE_DIE("forward pass failed at step %d", step);
+                }
+            } else {
+                if (!diffuse_forward_full(ctx, seq.data(), total_len,
+                                          logits_full.data(),
+                                          use_cache ? &cache : nullptr)) {
+                    DIFFUSE_DIE("forward pass failed at step %d", step);
+                }
             }
             if (use_cache) cache.update_seq(seq.data(), total_len);
             logit_source = logits_full.data();

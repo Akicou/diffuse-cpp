@@ -2,41 +2,37 @@
 
 #include "diffuse-common.h"
 #include "diffuse-cache.h"
-#include <vector>
 
-// Build the full transformer forward pass as a GGML computation graph.
-// Returns the logits tensor [n_tokens, n_vocab].
-struct ggml_cgraph * diffuse_build_graph(
-    diffuse_context * ctx,
-    struct ggml_context * ctx_compute,
-    const int32_t * tokens,
-    int n_tokens);
+// ── Compute buffer helpers (used by diffuse-graph.cpp and diffuse-moe-graph.cpp) ──
+size_t diffuse_compute_buf_size(const diffuse_hparams & hp, int n_tokens);
+struct ggml_context * diffuse_new_compute_ctx(diffuse_context * dctx, size_t needed);
+void diffuse_ensure_compute_buf(diffuse_context * dctx, size_t needed);
 
-// Full forward pass. If cache is non-null, extracts K/V into cache.
-// logits_out: [n_tokens * n_vocab]
-bool diffuse_forward_full(
-    diffuse_context * ctx,
-    const int32_t * tokens,
-    int n_tokens,
-    float * logits_out,
-    diffuse_step_cache * cache);
+// ── Forward passes (standard diffusion) ─────────────────────────
+bool diffuse_forward_full(diffuse_context * ctx,
+                          const int32_t * tokens, int n_tokens,
+                          float * logits_out,
+                          diffuse_step_cache * cache);
 
-// Original forward pass (no cache). Backward compatible.
-bool diffuse_forward(
-    diffuse_context * ctx,
-    const int32_t * tokens,
-    int n_tokens,
-    float * logits_out);
-
-// Cached forward: computes only for active positions.
-// logits_out: [n_active * n_vocab]
 bool diffuse_forward_cached(
-    diffuse_context * ctx,
-    const int32_t * active_tokens,
-    const int32_t * active_pos_indices,
-    int n_active,
-    int n_total,
-    diffuse_step_cache * cache,
-    const std::vector<int> & cached_positions,
-    const std::vector<int> & active_positions,
-    float * logits_out);
+        diffuse_context * ctx,
+        const int32_t * active_tokens,
+        const int32_t * active_pos_indices,
+        int n_active,
+        int n_total,
+        diffuse_step_cache * cache,
+        const std::vector<int> & cached_positions,
+        const std::vector<int> & active_positions,
+        float * logits_out);
+
+// ── LLaDA2 MoE forward pass ─────────────────────────────────────
+bool diffuse_forward_moe(diffuse_context * ctx,
+                         const int32_t * tokens, int n_tokens,
+                         float * logits_out);
+
+// Full MoE forward with KV cache extraction
+bool diffuse_forward_moe_full(diffuse_context * ctx,
+                              const int32_t * tokens, int n_tokens,
+                              float * logits_out,
+                              diffuse_step_cache * cache);
+

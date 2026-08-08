@@ -130,6 +130,7 @@ diffuse_model * diffuse_model_load_impl(const std::string & path, int n_threads)
     const char * arch_name = "unknown";
     if (model->model_type == "llada")  arch_name = "LLaDA (Llama backbone, diffusion)";
     else if (model->model_type == "dream")  arch_name = "Dream (Qwen2.5 backbone, diffusion)";
+    else if (model->model_type == "llada2_moe")  arch_name = "LLaDA2 MoE (diffusion)";
     else if (model->model_type == "qwen2")  arch_name = "Qwen2.5 (autoregressive)";
     else if (model->model_type == "llama")  arch_name = "Llama (autoregressive)";
 
@@ -159,6 +160,8 @@ diffuse_model * diffuse_model_load_impl(const std::string & path, int n_threads)
 
     // Layers
     model->layers.resize(hp.n_layer);
+    // Skip standard layer loading for MoE models (loaded below)
+    if (model->model_type != "llada2_moe") {
     for (uint32_t i = 0; i < hp.n_layer; i++) {
         auto & l = model->layers[i];
         l.attn_norm = get_tensor(meta_ctx, fmt_layer("blk.%d.attn_norm.weight", i).c_str());
@@ -175,6 +178,77 @@ diffuse_model * diffuse_model_load_impl(const std::string & path, int n_threads)
         l.bq = ggml_get_tensor(meta_ctx, fmt_layer("blk.%d.attn_q.bias", i).c_str());
         l.bk = ggml_get_tensor(meta_ctx, fmt_layer("blk.%d.attn_k.bias", i).c_str());
         l.bv = ggml_get_tensor(meta_ctx, fmt_layer("blk.%d.attn_v.bias", i).c_str());
+    }  // close for loop
+    }  // close if (not llada2_moe)
+
+    // ── Load LLaDA2 MoE layers (if model is llada2_moe) ──────────
+    if (model->model_type == "llada2_moe") {
+        // Parse MoE hyperparameters from metadata
+        model->n_experts         = get_u32_multi(gctx, "expert_count", 0, false);
+        model->n_experts_per_tok = get_u32_multi(gctx, "expert_used_count", 0, false);
+        model->n_shared_experts  = get_u32_multi(gctx, "expert_shared_count", 0, false);
+        model->moe_intermediate  = get_u32_multi(gctx, "expert_feed_forward_length", 0, false);
+        model->first_k_dense     = get_u32_multi(gctx, "first_k_dense_replace", 0, false);
+        model->head_dim          = get_u32_multi(gctx, "head_dim", hp.n_embd / hp.n_head, false);
+        model->rotary_dim        = get_u32_multi(gctx, "rotary_dim", model->head_dim, false);
+        model->use_qk_norm       = get_u32_multi(gctx, "use_qk_norm", 0, false);
+        model->routed_scaling    = get_f32_multi(gctx, "routed_scaling_factor", 1.0f);
+        model->norm_topk_prob    = get_u32_multi(gctx, "norm_topk_prob", 1, false);
+        model->moe_block_size    = get_u32_multi(gctx, "moe_block_size", 32, false);
+        model->expert_capacity   = get_u32_multi(gctx, "expert_capacity", 48, false);
+        model->delete_token_id   = get_u32_multi(gctx, "delete_token_id", 0, false);
+        model->split_token_id    = get_u32_multi(gctx, "split_token_id", 0, false);
+
+        DIFFUSE_LOG("  MoE: %u experts (top-%u), %u shared, moe_ff=%u, first_dense=%u",
+                    model->n_experts, model->n_experts_per_tok,
+                    model->n_shared_experts, model->moe_intermediate,
+                    model->first_k_dense);
+        DIFFUSE_LOG("  head_dim=%u, rotary_dim=%u, qk_norm=%s, routed_scale=%.1f",
+                    model->head_dim, model->rotary_dim,
+                    model->use_qk_norm ? "yes" : "no",
+                    model->routed_scaling);
+
+        model->moe_layers.resize(hp.n_layer);
+        for (uint32_t i = 0; i < hp.n_layer; i++) {
+            auto & ml = model->moe_layers[i];
+            ml.is_moe = (i >= model->first_k_dense);
+
+            // Norms
+            ml.attn_norm      = get_tensor(meta_ctx, fmt_layer("blk.%d.attn_norm.weight", i).c_str());
+            ml.post_attn_norm = get_tensor(meta_ctx, fmt_layer("blk.%d.post_attn_norm.weight", i).c_str());
+
+            // Fused QKV
+            ml.qkv = get_tensor(meta_ctx, fmt_layer("blk.%d.attn_qkv.weight", i).c_str());
+            // Attention output
+            ml.wo = get_tensor(meta_ctx, fmt_layer("blk.%d.attn_output.weight", i).c_str());
+
+            // QK norm (optional)
+            if (model->use_qk_norm) {
+                ml.q_norm = get_tensor(meta_ctx, fmt_layer("blk.%d.attn_q_norm.weight", i).c_str());
+                ml.k_norm = get_tensor(meta_ctx, fmt_layer("blk.%d.attn_k_norm.weight", i).c_str());
+            }
+
+            if (!ml.is_moe) {
+                // Dense MLP
+                ml.ffn_gate = get_tensor(meta_ctx, fmt_layer("blk.%d.ffn_gate.weight", i).c_str());
+                ml.ffn_up   = get_tensor(meta_ctx, fmt_layer("blk.%d.ffn_up.weight", i).c_str());
+                ml.ffn_down = get_tensor(meta_ctx, fmt_layer("blk.%d.ffn_down.weight", i).c_str());
+            } else {
+                // MoE
+                ml.gate_weight = get_tensor(meta_ctx, fmt_layer("blk.%d.moe_gate.weight", i).c_str());
+                ml.gate_bias   = ggml_get_tensor(meta_ctx, fmt_layer("blk.%d.moe_gate_bias.weight", i).c_str());
+
+                ml.expert_gate = get_tensor(meta_ctx, fmt_layer("blk.%d.moe_experts_gate.weight", i).c_str());
+                ml.expert_up   = get_tensor(meta_ctx, fmt_layer("blk.%d.moe_experts_up.weight", i).c_str());
+                ml.expert_down = get_tensor(meta_ctx, fmt_layer("blk.%d.moe_experts_down.weight", i).c_str());
+
+                if (model->n_shared_experts > 0) {
+                    ml.shared_gate = get_tensor(meta_ctx, fmt_layer("blk.%d.moe_shared_gate.weight", i).c_str());
+                    ml.shared_up   = get_tensor(meta_ctx, fmt_layer("blk.%d.moe_shared_up.weight", i).c_str());
+                    ml.shared_down = get_tensor(meta_ctx, fmt_layer("blk.%d.moe_shared_down.weight", i).c_str());
+                }
+            }
+        }
     }
 
     DIFFUSE_LOG("model loaded: %lld tensors",

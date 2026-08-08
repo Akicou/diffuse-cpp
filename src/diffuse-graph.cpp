@@ -7,11 +7,9 @@ static struct ggml_tensor * ensure_f32(struct ggml_context * ctx, struct ggml_te
     return t;
 }
 
-// ── Forward declarations for persistent compute buffer helpers ──
-// (defined after the graph builders; used by diffuse_forward_full/cached)
-static size_t diffuse_compute_buf_size(const diffuse_hparams & hp, int n_tokens);
-static void   diffuse_ensure_compute_buf(diffuse_context * dctx, size_t needed);
-static struct ggml_context * diffuse_new_compute_ctx(diffuse_context * dctx, size_t needed);
+// ── Compute buffer helpers ──
+// (declared in diffuse-graph.h, defined below)
+// Used by diffuse-graph.cpp, diffuse-moe-graph.cpp
 
 // ── Build transformer forward graph ────────────────────────────
 struct ggml_cgraph * diffuse_build_graph(
@@ -623,10 +621,14 @@ bool diffuse_forward_cached(
     return true;
 }
 
-// ── Original forward pass (unchanged, for backward compat) ──────
+// ── Forward pass dispatcher ─────────────────────────────────────
+// Routes to MoE or standard forward based on model type.
 bool diffuse_forward(diffuse_context * ctx,
                      const int32_t * tokens, int n_tokens,
                      float * logits_out) {
+    if (ctx->model->model_type == "llada2_moe") {
+        return diffuse_forward_moe(ctx, tokens, n_tokens, logits_out);
+    }
     return diffuse_forward_full(ctx, tokens, n_tokens, logits_out, nullptr);
 }
 
@@ -635,7 +637,7 @@ bool diffuse_forward(diffuse_context * ctx,
 // hold all intermediate tensors for n_layer transformer blocks plus the
 // final logits projection. We size conservatively; the persistent buffer
 // is reused across steps, so over-allocation is one-time.
-static size_t diffuse_compute_buf_size(const diffuse_hparams & hp, int n_tokens) {
+size_t diffuse_compute_buf_size(const diffuse_hparams & hp, int n_tokens) {
     const size_t n_embd = hp.n_embd;
     const size_t n_head = hp.n_head;
     const size_t n_ff   = hp.n_ff;
@@ -661,7 +663,7 @@ static size_t diffuse_compute_buf_size(const diffuse_hparams & hp, int n_tokens)
 }
 
 // ── Allocate or grow the persistent compute buffer ──────────────
-static void diffuse_ensure_compute_buf(diffuse_context * dctx, size_t needed) {
+void diffuse_ensure_compute_buf(diffuse_context * dctx, size_t needed) {
     if (dctx->compute_buf_size >= needed) return;
 
     // Free old buffer if present
@@ -683,7 +685,7 @@ static void diffuse_ensure_compute_buf(diffuse_context * dctx, size_t needed) {
 // memory, effectively "resetting" it for the next graph build. This is
 // the key optimization: we avoid malloc/free of multi-GB buffers on
 // every diffusion step.
-static struct ggml_context * diffuse_new_compute_ctx(diffuse_context * dctx, size_t needed) {
+struct ggml_context * diffuse_new_compute_ctx(diffuse_context * dctx, size_t needed) {
     diffuse_ensure_compute_buf(dctx, needed);
 
     struct ggml_init_params cparams = {

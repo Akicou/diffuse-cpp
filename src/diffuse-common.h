@@ -53,6 +53,36 @@ struct diffuse_layer {
     struct ggml_tensor * ffn_down;    // down projection (w2)
 };
 
+// ── LLaDA2 MoE layer (diffusion MoE) ───────────────────────────
+struct diffuse_moe_layer {
+    // Attention (fused QKV + QK norm + partial rotary)
+    struct ggml_tensor * attn_norm       = nullptr;  // input_layernorm
+    struct ggml_tensor * post_attn_norm  = nullptr;  // post_attention_layernorm
+    struct ggml_tensor * qkv             = nullptr;  // fused query_key_value.weight
+    struct ggml_tensor * q_norm          = nullptr;  // query_layernorm (RMSNorm on head_dim)
+    struct ggml_tensor * k_norm          = nullptr;  // key_layernorm
+    struct ggml_tensor * wo              = nullptr;  // attention.dense.weight
+
+    // Dense MLP (for first_k_dense_replace layers)
+    struct ggml_tensor * ffn_gate        = nullptr;
+    struct ggml_tensor * ffn_up          = nullptr;
+    struct ggml_tensor * ffn_down        = nullptr;
+
+    // MoE router + experts
+    struct ggml_tensor * gate_weight     = nullptr;  // [n_embd, n_experts]
+    struct ggml_tensor * gate_bias       = nullptr;  // [n_experts] (expert_bias)
+    struct ggml_tensor * expert_gate     = nullptr;  // [n_embd, moe_ff, n_experts] (stacked)
+    struct ggml_tensor * expert_up       = nullptr;
+    struct ggml_tensor * expert_down     = nullptr;
+
+    // Shared expert (always active)
+    struct ggml_tensor * shared_gate     = nullptr;
+    struct ggml_tensor * shared_up       = nullptr;
+    struct ggml_tensor * shared_down     = nullptr;
+
+    bool is_moe = false;  // true for MoE layers, false for dense
+};
+
 // ── Full model struct ──────────────────────────────────────────
 struct diffuse_model {
     diffuse_hparams hparams;
@@ -65,6 +95,23 @@ struct diffuse_model {
 
     // Layers
     std::vector<diffuse_layer> layers;
+    std::vector<diffuse_moe_layer> moe_layers;  // LLaDA2 MoE layers
+
+    // MoE hyperparameters (LLaDA2)
+    uint32_t n_experts          = 0;
+    uint32_t n_experts_per_tok  = 0;
+    uint32_t n_shared_experts   = 0;
+    uint32_t moe_intermediate   = 0;
+    uint32_t first_k_dense      = 0;
+    uint32_t head_dim           = 0;  // head_dim (may differ from n_embd/n_head)
+    uint32_t rotary_dim         = 0;  // partial rotary dimension
+    bool     use_qk_norm        = false;
+    float    routed_scaling     = 1.0f;
+    bool     norm_topk_prob     = true;
+    uint32_t moe_block_size     = 32;
+    uint32_t expert_capacity    = 48;
+    uint32_t delete_token_id    = 0;
+    uint32_t split_token_id     = 0;
 
     // GGML backend
     ggml_backend_t          backend = nullptr;
