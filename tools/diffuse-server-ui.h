@@ -299,10 +299,13 @@ body {
         <input type="number" id="temperature" value="0.0" min="0" max="2" step="0.1">
     </div>
     <div class="setting-row">
+        <label>Threshold</label>
+        <input type="number" id="threshold" value="0.95" min="0" max="1" step="0.05">
+    </div>
+    <div class="setting-row">
         <label>Remasking</label>
         <select id="remasking">
-            <option value="entropy_exit" selected>entropy_exit</option>
-            <option value="low_confidence">low_confidence</option>
+            <option value="low_confidence" selected>low_confidence</option>
             <option value="random">random</option>
         </select>
     </div>
@@ -451,6 +454,7 @@ async function sendMessage() {
         n_steps: parseInt(document.getElementById('steps').value) || 16,
         temperature: parseFloat(document.getElementById('temperature').value) || 0.0,
         remasking: document.getElementById('remasking').value,
+        threshold: parseFloat(document.getElementById('threshold').value) || 0.95,
         seed: 42,
     };
 

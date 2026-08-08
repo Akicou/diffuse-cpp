@@ -171,8 +171,16 @@ def main():
     writer.add_uint32("diffuse.first_k_dense_replace", first_k_dense)
     writer.add_float32("diffuse.routed_scaling_factor", routed_scaling_factor)
     writer.add_uint32("diffuse.norm_topk_prob", 1 if norm_topk_prob else 0)
+    writer.add_uint32("diffuse.block_length", block_size)
     writer.add_uint32("diffuse.moe_block_size", block_size)
     writer.add_uint32("diffuse.expert_capacity", expert_capacity)
+
+    # Group routing (DeepSeek-V2 style)
+    writer.add_uint32("diffuse.n_group", config.get("n_group", 8))
+    writer.add_uint32("diffuse.topk_group", config.get("topk_group", 4))
+
+    # EOS token
+    writer.add_uint32("diffuse.eos_token_id", config.get("pad_token_id", 156892))
 
     # Delete/split tokens for generation
     writer.add_uint32("diffuse.delete_token_id", 156930)

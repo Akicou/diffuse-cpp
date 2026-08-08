@@ -281,8 +281,8 @@ struct ServerState {
     int n_steps = 16;
     int n_generate_default = 256;
     float temperature = 0.0f;
-    float entropy_threshold = 1.5f;
-    std::string remasking = "entropy_exit";
+    float threshold = 0.95f;
+    std::string remasking = "low_confidence";
     std::string api_key;
     bool verbose = false;
 
@@ -371,18 +371,14 @@ static diffuse_sampler_params parse_sampler_params(const json::Value & req_json)
     diffuse_sampler_params sp;
     sp.n_steps = req_json["n_steps"].as_int(g_state.n_steps);
     sp.temperature = req_json["temperature"].as_number(g_state.temperature);
-    sp.entropy_threshold = req_json["entropy_threshold"].as_number(g_state.entropy_threshold);
+    sp.threshold = req_json["threshold"].as_number(g_state.threshold);
     sp.seed = req_json["seed"].as_int(42);
-    sp.use_cache = req_json["use_cache"].as_bool(true);
+    sp.eos_early_stop = req_json["eos_early_stop"].as_bool(true);
+    sp.enable_editing = req_json["enable_editing"].as_bool(true);
 
-    // Remasking strategy
     std::string remasking = req_json["remasking"].as_string(g_state.remasking);
-    if (remasking == "low_confidence") sp.remasking = diffuse_remasking::LOW_CONFIDENCE;
-    else if (remasking == "random") sp.remasking = diffuse_remasking::RANDOM;
-    else if (remasking == "entropy_exit") sp.remasking = diffuse_remasking::ENTROPY_EXIT;
-    else if (remasking == "maskgit_plus") sp.remasking = diffuse_remasking::MASKGIT_PLUS;
-    else if (remasking == "topk_margin") sp.remasking = diffuse_remasking::TOPK_MARGIN;
-    else sp.remasking = diffuse_remasking::ENTROPY_EXIT;
+    if (remasking == "random") sp.remasking = diffuse_remasking::RANDOM;
+    else sp.remasking = diffuse_remasking::LOW_CONFIDENCE;
 
     return sp;
 }
@@ -468,8 +464,7 @@ static HttpResponse handle_chat_completion(const HttpRequest & req) {
     diffuse_context * ctx = diffuse_context_new_gpu(g_state.model, n_ctx, g_state.n_threads, g_state.n_gpu_layers);
 
     auto result = diffuse_generate(ctx, prompt_tokens, n_generate, sp,
-        [](int step, int total, const std::vector<int32_t> &) {
-            // Progress callback (could be used for streaming)
+        [](int blk, int total_blk, int step, int total_step, const std::vector<int32_t> &) {
         });
 
     auto t1 = std::chrono::steady_clock::now();
@@ -833,7 +828,7 @@ static void print_usage(const char * prog) {
         "  -n INT           Default tokens to generate (default: 256)\n"
         "  --temp FLOAT     Default temperature (default: 0.0 = argmax)\n"
         "  --remasking STR  Default remasking: entropy_exit|low_confidence|random (default: entropy_exit)\n"
-        "  --entropy-threshold F  Entropy threshold (default: 1.5)\n"
+        "  --threshold F     Confidence threshold (default: 0.95)\n"
         "  --api-key KEY    Require API key for API endpoints (default: none)\n"
         "  --verbose        Log every request\n"
         "  -h, --help       Show this help\n\n"
@@ -867,7 +862,7 @@ int main(int argc, char ** argv) {
         else if (arg == "-n" && i + 1 < argc) g_state.n_generate_default = atoi(argv[++i]);
         else if (arg == "--temp" && i + 1 < argc) g_state.temperature = atof(argv[++i]);
         else if (arg == "--remasking" && i + 1 < argc) g_state.remasking = argv[++i];
-        else if (arg == "--entropy-threshold" && i + 1 < argc) g_state.entropy_threshold = atof(argv[++i]);
+        else if (arg == "--threshold" && i + 1 < argc) g_state.threshold = atof(argv[++i]);
         else if (arg == "--api-key" && i + 1 < argc) g_state.api_key = argv[++i];
         else if (arg == "--verbose") g_state.verbose = true;
         else if (arg == "-h" || arg == "--help") {
