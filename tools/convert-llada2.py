@@ -56,11 +56,16 @@ def bf16_to_f32(raw: np.ndarray) -> np.ndarray:
 
 def load_tensor(st_file, name):
     """Load a tensor from a safetensors file, converting bf16 to f32."""
-    with safe_open(st_file, framework="numpy") as f:
+    import torch
+    with safe_open(st_file, framework="torch") as f:
         tensor = f.get_tensor(name)
-    if tensor.dtype == np.uint16:
-        # Could be bf16
-        tensor = bf16_to_f32(tensor)
+    # Convert bf16 to f32 numpy
+    if tensor.dtype == torch.bfloat16:
+        tensor = tensor.to(torch.float32).numpy()
+    elif tensor.dtype == torch.float16:
+        tensor = tensor.to(torch.float32).numpy()
+    else:
+        tensor = tensor.numpy()
     return tensor
 
 
