@@ -827,7 +827,7 @@ static void print_usage(const char * prog) {
         "  -s INT           Default diffusion steps (default: 16)\n"
         "  -n INT           Default tokens to generate (default: 256)\n"
         "  --temp FLOAT     Default temperature (default: 0.0 = argmax)\n"
-        "  --remasking STR  Default remasking: entropy_exit|low_confidence|random (default: entropy_exit)\n"
+        "  --remasking STR  Default remasking: low_confidence|random (default: low_confidence)\n"
         "  --threshold F     Confidence threshold (default: 0.95)\n"
         "  --api-key KEY    Require API key for API endpoints (default: none)\n"
         "  --verbose        Log every request\n"
