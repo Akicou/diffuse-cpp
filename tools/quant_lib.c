@@ -3,6 +3,10 @@
 // Build: gcc -shared -fPIC -o quant_lib.so quant_lib.c -I ggml/include -L ggml/src -lggml
 
 #include <ggml.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 #include <string.h>
 #include <stdlib.h>
 
@@ -46,3 +50,7 @@ void init_quant(int dst_type_int) {
 // Cleanup (no-op in this GGML version)
 void cleanup_quant(void) {
 }
+
+#ifdef __cplusplus
+}
+#endif
