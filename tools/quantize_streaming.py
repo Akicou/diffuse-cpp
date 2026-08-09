@@ -156,12 +156,10 @@ def main():
         else:
             # Dequantize to F32
             if src_raw == Q.F16:
-                f32 = np.zeros(nelem, dtype=np.float32)
-                lib.f16_to_f32(ctypes.c_void_p(data_ref.ctypes.data if hasattr(data_ref, 'ctypes') else data_ref.__array_interface__['data'][0]),
-                              f32.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-                              ctypes.c_int64(nelem))
+                # data_ref is a numpy float16 memmap — use directly
+                f32 = data_ref.astype(np.float32).ravel()
             elif src_raw == Q.F32:
-                f32 = np.frombuffer(data_ref, dtype=np.float32).astype(np.float32).copy()
+                f32 = data_ref.astype(np.float32).ravel().copy()
             else:
                 f32 = None
 
