@@ -8,7 +8,7 @@ High-performance C++ inference engine for **Diffusion Language Models**, built o
 - **Block-causal attention**: bidirectional within blocks, causal across blocks
 - **Confidence-threshold generation**: commit tokens when p > 0.95, matching the reference implementation
 - **Levenshtein editing**: KEEP / SUBSTITUTE / DELETE / INSERT operations
-- **Group-limited MoE routing**: DeepSeek-V2 style sigmoid router with expert bias
+- **Block MoE routing**: sigmoid router with expert bias and per-block expert capacity
 - **Integrated BPE tokenizer**: embedded in GGUF — no Python needed
 - **`diffuse-server`**: HTTP API server with web UI (like `llama-server`)
 - **GPU acceleration** via Vulkan (cross-vendor), CUDA (NVIDIA), or HIP (AMD ROCm)
@@ -30,7 +30,9 @@ LLaDA2.2 generates text through **block diffusion** — a semi-autoregressive pr
    - If not enough exceed threshold, commit **top-k by confidence**
    - Repeat until all positions are unmasked
 
-This matches the reference implementation in dFactory's `generate()` method.
+This matches `generate()` in the reference `modeling_llada2_moe.py`. Blocks tile
+from absolute position 0, so a prompt that does not end on a block boundary
+shares its block with the first generated tokens.
 
 ### Levenshtein Editing (LLaDA2.2)
 
@@ -42,12 +44,19 @@ Unlike fixed-length substitution (LLaDA2.0/2.1), LLaDA2.2 supports four edit ope
 
 ### MoE Routing
 
-LLaDA2.2 uses **DeepSeek-V2 style group-limited routing**:
-- Sigmoid scoring (not softmax)
-- Expert bias addition
-- Group selection: 8 groups → select top-4 groups → top-8 experts within selected
-- Normalized weights × routed_scaling_factor (2.5)
-- 1 shared expert (always active)
+LLaDA2.2 uses **block routing** — expert choice is made per block of tokens, not
+per token alone:
+
+1. Sigmoid scoring (not softmax), plus a per-expert bias that affects *selection
+   only* — the applied weights come from the unbiased scores
+2. For each 32-token block, take every expert's **max** score over the block and
+   keep the top `expert_capacity` (48 of 256)
+3. Each token then picks its top-8 experts **within that allowed set**
+4. Weights renormalized over the top-8, × `routed_scaling_factor` (2.5)
+5. 1 shared expert, always active, running on the block input
+
+> `n_group` / `topk_group` appear in `config.json` but the reference model never
+> reads them — LLaDA2 does not use DeepSeek-style group-limited routing.
 
 ### Flat Diffusion (LLaDA 1.0 / Dream)
 
@@ -76,12 +85,20 @@ cmake --build build -j$(nproc)
 ### Convert a Model
 
 ```bash
-python tools/convert-llada2.py \
+# HF checkpoint → F16 GGUF (streaming; peak RAM stays near the largest tensor)
+python tools/convert-llada2-fast.py \
     --input /path/to/LLaDA2.2-flash \
     --output llada2-flash-f16.gguf --type f16
+
+# F16 GGUF → quantized (q4_k_s, q4_k_m, q6_k, q8_0, q4_0)
+cc -O3 -shared -fPIC tools/quant_lib.c -o quant_lib.so -Iggml/include -Lbuild/ggml/src -lggml-base
+python tools/quantize_streaming.py \
+    --input llada2-flash-f16.gguf \
+    --output llada2-flash-q4_k_s.gguf --type q4_k_s --lib ./quant_lib.so
 ```
 
-The converter embeds the BPE tokenizer (vocab, merges, special tokens) into the GGUF.
+The converter embeds the BPE tokenizer (vocab, merges, special tokens) and the
+chat template into the GGUF.
 
 ### Run the Server
 
@@ -131,23 +148,28 @@ OpenAI-compatible endpoints:
 
 ```
 src/
-  diffuse-tokenizer.{h,cpp}    BPE tokenizer
+  diffuse-tokenizer.{h,cpp}    BPE tokenizer (special-token aware, chat templates)
   diffuse-model.{h,cpp}        GGUF loading (dense + MoE)
   diffuse-graph.{h,cpp}        Dense forward + compute infrastructure
-  diffuse-moe-graph.cpp        MoE graph with block-causal attention + group routing
+  diffuse-moe-graph.cpp        MoE graph: block-causal attention + block routing
   diffuse-sampler.{h,cpp}      Block-sequential + flat generation, Levenshtein editing
   diffuse-backend.h            GGML backend scheduler (CPU/GPU)
   diffuse-json.h               JSON parser/serializer
-  diffuse-cache.h              (Legacy, unused for block diffusion)
+  diffuse-common.h             Shared model/context structs
 
 tools/
   diffuse-server.cpp           HTTP server + web UI
   diffuse-server-ui.h          Embedded chat interface
   main-cli.cpp                 CLI inference
-  convert-llada2.py            HF → GGUF converter (embeds tokenizer)
+  dump-logits.cpp              Raw logit dump (cross-validation)
+  convert-llada2-fast.py       HF → GGUF converter (embeds tokenizer + template)
+  quantize_streaming.py        Streaming quantizer driver
+  quant_lib.c                  ggml quantizer shim used by the driver
+  quantize.cpp                 Standalone quantizer (diffuse-quantize)
 
 tests/
   test-tokenizer.cpp           Tokenizer unit tests
+  test-forward.cpp             Forward-pass smoke test
   test-server.py               Server API validation
 ```
 

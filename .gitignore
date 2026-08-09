@@ -10,6 +10,13 @@ __pycache__/
 *.pyc
 .cache/
 compile_commands.json
+
+# Editor / assistant local state
+.claude/
+.cursor/
+.aider*
+.vscode/
+.idea/
 .DS_Store
 *.swp
 *~

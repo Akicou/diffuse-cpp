@@ -894,7 +894,7 @@ int main(int argc, char ** argv) {
             if (!ok) {
                 fprintf(stderr, "[server] WARNING: No tokenizer found in GGUF.\n");
                 fprintf(stderr, "[server]          Text input will not work. Re-convert with:\n");
-                fprintf(stderr, "[server]          python convert-llada2.py --input ... --output ... --embed-tokenizer\n");
+                fprintf(stderr, "[server]          python tools/convert-llada2-fast.py --input ... --output ...\n");
             }
             gguf_free(gctx);
         }
