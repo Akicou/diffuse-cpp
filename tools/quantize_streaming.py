@@ -77,7 +77,7 @@ class GGUFHeader:
         for d in t['ne']: nelem *= d
 
         # Compute byte size based on type
-        type_sizes = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 8: 2}  # F16=8
+        type_sizes = {0: 4, 1: 2}  # F16=8
         elem_sz = type_sizes.get(t['type'], 4)
         nbytes = nelem * elem_sz
 
