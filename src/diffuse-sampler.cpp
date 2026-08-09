@@ -259,8 +259,10 @@ static std::vector<int32_t> generate_block_diffusion(
 
         // Check for EOS in completed block. LLaDA2 ends an assistant turn with
         // <|role_end|>, which is a separate id from <|endoftext|>, so both stop.
+        // Scan only the generated span: the prompt itself contains <|role_end|>
+        // separators, and matching those would return a negative-length range.
         if (params.eos_early_stop && (eos_id > 0 || params.stop_token_2 >= 0)) {
-            for (int i = block_start; i < cur_window_end; i++) {
+            for (int i = std::max(block_start, prompt_len); i < cur_window_end; i++) {
                 if (seq[i] == eos_id || (params.stop_token_2 >= 0 && seq[i] == params.stop_token_2)) {
                     // Check all positions before EOS are unmasked
                     bool all_clear = true;
