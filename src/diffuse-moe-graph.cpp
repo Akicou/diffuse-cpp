@@ -133,10 +133,10 @@ static struct ggml_cgraph * diffuse_build_graph_moe(
         struct ggml_tensor * K = ggml_view_2d(ctx, qkv, head_dim * n_head_kv, N, head_dim * (n_head + 2*n_head_kv) * sizeof(float), q_dim * sizeof(float));
         struct ggml_tensor * V = ggml_view_2d(ctx, qkv, head_dim * n_head_kv, N, head_dim * (n_head + 2*n_head_kv) * sizeof(float), (q_dim + kv_dim) * sizeof(float));
 
-        // Reshape for multi-head
-        Q = ggml_reshape_3d(ctx, Q, head_dim, n_head, N);
-        K = ggml_reshape_3d(ctx, K, head_dim, n_head_kv, N);
-        V = ggml_reshape_3d(ctx, V, head_dim, n_head_kv, N);
+        // Reshape for multi-head (need cont since view_2d is non-contiguous)
+        Q = ggml_reshape_3d(ctx, ggml_cont(ctx, Q), head_dim, n_head, N);
+        K = ggml_reshape_3d(ctx, ggml_cont(ctx, K), head_dim, n_head_kv, N);
+        V = ggml_reshape_3d(ctx, ggml_cont(ctx, V), head_dim, n_head_kv, N);
 
         // QK normalization (RMSNorm on head_dim)
         if (model.use_qk_norm && ml.q_norm) {
