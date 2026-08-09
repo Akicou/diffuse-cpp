@@ -14,13 +14,13 @@ base_model: inclusionAI/LLaDA2.2-flash
 
 # LLaDA2.2-flash GGUF
 
-Quantized GGUF files for [LLaDA2.2-flash](https://huggingface.co/inclusionAI/LLaDA2.2-flash), a 150B parameter (13B active) Mixture-of-Experts diffusion language model.
+Quantized GGUF files for [LLaDA2.2-flash](https://huggingface.co/inclusionAI/LLaDA2.2-flash), a 103B parameter (13B active) Mixture-of-Experts diffusion language model.
 
 ## Files
 
 | File | Format | Size | Use Case |
 |------|--------|------|----------|
-| `LLaDA2.2-flash-F16.gguf` | F16 | ~300 GB | Lossless, best quality |
+| `LLaDA2.2-flash-F16.gguf` | F16 | ~192 GB | Lossless, best quality |
 | `LLaDA2.2-flash-Q4_K_S.gguf` | Q4_K_S | ~85 GB | 4-bit quantized, balanced speed/quality |
 
 ## Usage with diffuse-cpp
@@ -92,7 +92,7 @@ The model also supports **Levenshtein editing** (KEEP/SUBSTITUTE/DELETE/INSERT) 
 
 ## Model Details
 
-- **Parameters**: 150B total, 13B active per token
+- **Parameters**: 103B total, 13B active per token
 - **Architecture**: MoE with 256 experts (top-8) + 1 shared expert
 - **Layers**: 32 (1 dense + 31 MoE)
 - **Hidden size**: 4096
@@ -101,6 +101,10 @@ The model also supports **Levenshtein editing** (KEEP/SUBSTITUTE/DELETE/INSERT) 
 - **Partial RoPE**: rotary_dim=64 (of 128)
 - **Context**: 128K tokens
 - **Vocab**: 157,184
+
+## ⚠️ Status
+
+**Inference is currently untested.** The GGUF files were converted from the original HuggingFace checkpoint and include the embedded BPE tokenizer. The diffuse-cpp inference engine implements the correct LLaDA2.2 block-diffusion architecture (block-causal attention, confidence-threshold generation, Levenshtein editing), but end-to-end generation has not yet been verified against the reference implementation.
 
 ## License
 

@@ -4,7 +4,7 @@ High-performance C++ inference engine for **Diffusion Language Models**, built o
 
 ## Highlights
 
-- **LLaDA2.2-flash** support with correct block-diffusion architecture
+- **LLaDA2.2-flash** support (~103B params, 13B active) with correct block-diffusion architecture
 - **Block-causal attention**: bidirectional within blocks, causal across blocks
 - **Confidence-threshold generation**: commit tokens when p > 0.95, matching the reference implementation
 - **Levenshtein editing**: KEEP / SUBSTITUTE / DELETE / INSERT operations
