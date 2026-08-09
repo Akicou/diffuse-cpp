@@ -73,8 +73,10 @@ static struct ggml_cgraph * diffuse_build_graph_dense(
 
         // GQA: repeat KV heads
         if (n_kv_div > 1) {
-            Kr = ggml_repeat(ctx, Kr, ggml_reshape_3d(ctx, Kr, Kr->ne[0], n_head, N));
-            V  = ggml_repeat(ctx, V,  ggml_reshape_3d(ctx, V,  V->ne[0], n_head, N));
+            Kr = ggml_cont(ctx, Kr);
+            V  = ggml_cont(ctx, V);
+            Kr = ggml_repeat(ctx, Kr, ggml_new_tensor_3d(ctx, Kr->type, Kr->ne[0], n_head, N));
+            V  = ggml_repeat(ctx, V,  ggml_new_tensor_3d(ctx, V->type,  V->ne[0], n_head, N));
         }
 
         // Full bidirectional attention (flat diffusion — no causal mask)

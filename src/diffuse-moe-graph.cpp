@@ -153,9 +153,13 @@ static struct ggml_cgraph * diffuse_build_graph_moe(
 
         // GQA: repeat KV heads
         if (n_kv_div > 1) {
-            struct ggml_tensor * k_expanded = ggml_reshape_3d(ctx, K, K->ne[0], n_head, N);
+            // K/V are [head_dim, n_kv_head, N] after RoPE — need to expand to n_head
+            // ggml_repeat requires contiguous input, so cont first
+            K = ggml_cont(ctx, K);
+            V = ggml_cont(ctx, V);
+            struct ggml_tensor * k_expanded = ggml_new_tensor_3d(ctx, K->type, K->ne[0], n_head, N);
             K = ggml_repeat(ctx, K, k_expanded);
-            struct ggml_tensor * v_expanded = ggml_reshape_3d(ctx, V, V->ne[0], n_head, N);
+            struct ggml_tensor * v_expanded = ggml_new_tensor_3d(ctx, V->type, V->ne[0], n_head, N);
             V = ggml_repeat(ctx, V, v_expanded);
         }
 
