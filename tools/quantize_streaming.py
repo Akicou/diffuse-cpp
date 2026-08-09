@@ -1,9 +1,91 @@
 #!/usr/bin/env python3
-"""Streaming GGUF quantizer using C library via ctypes."""
+"""Pure streaming GGUF quantizer — reads via file I/O, no mmap.
 
-import argparse, ctypes, os, time, struct
+Combines the streaming converter pattern with C-library quantization.
+Memory: ~2× largest tensor (~4GB peak).
+"""
+
+import argparse, ctypes, json, os, struct, time
 import numpy as np
-import gguf
+
+# ── GGUF binary reader ─────────────────────────────────────────
+
+class GGUFHeader:
+    def __init__(self, path):
+        self.f = open(path, 'rb')
+        magic = self.f.read(4)
+        self.version = struct.unpack('<I', self.f.read(4))[0]
+        n_kv = struct.unpack('<Q', self.f.read(8))[0]
+        n_tensors = struct.unpack('<Q', self.f.read(8))[0]
+        self.n_kv = n_kv
+        self.n_tensors = n_tensors
+
+        # Parse KV pairs (we need values for the output)
+        self.kv = {}  # key → (type_enum, raw_value)
+        for _ in range(n_kv):
+            klen = struct.unpack('<Q', self.f.read(8))[0]
+            key = self.f.read(klen).decode('utf-8')
+            vtype = struct.unpack('<I', self.f.read(4))[0]
+            val = self._read_value(vtype)
+            self.kv[key] = (vtype, val)
+
+        # Parse tensor info
+        self.tensors = []
+        for _ in range(n_tensors):
+            nlen = struct.unpack('<Q', self.f.read(8))[0]
+            name = self.f.read(nlen).decode('utf-8')
+            n_dims = struct.unpack('<I', self.f.read(4))[0]
+            ne = []
+            for _ in range(n_dims):
+                ne.append(struct.unpack('<q', self.f.read(8))[0])
+            ttype = struct.unpack('<I', self.f.read(4))[0]
+            offset = struct.unpack('<Q', self.f.read(8))[0]
+            self.tensors.append({'name': name, 'n_dims': n_dims, 'ne': ne, 'type': ttype, 'offset': offset})
+
+        self.data_start = self.f.tell()
+        # Align
+        align = self.kv.get('general.alignment', (0, 32))[1] or 32
+        if self.data_start % align != 0:
+            self.data_start += align - (self.data_start % align)
+
+    def _read_value(self, vtype):
+        if vtype <= 1: return self.f.read(1)[0]  # u8/i8
+        elif vtype <= 3: return struct.unpack('<H', self.f.read(2))[0]  # u16/i16
+        elif vtype == 4: return struct.unpack('<I', self.f.read(4))[0]  # u32
+        elif vtype == 5: return struct.unpack('<i', self.f.read(4))[0]  # i32
+        elif vtype == 6: return struct.unpack('<f', self.f.read(4))[0]  # f32
+        elif vtype == 7: return self.f.read(1)[0] != 0  # bool
+        elif vtype == 8:  # string
+            slen = struct.unpack('<Q', self.f.read(8))[0]
+            return self.f.read(slen).decode('utf-8')
+        elif vtype == 9:  # array
+            arr_type = struct.unpack('<I', self.f.read(4))[0]
+            arr_n = struct.unpack('<Q', self.f.read(8))[0]
+            if arr_type == 8:  # string array
+                return [self._read_value(8) for _ in range(arr_n)]
+            else:
+                return [self._read_value(arr_type) for _ in range(arr_n)]
+        elif vtype == 10: return struct.unpack('<Q', self.f.read(8))[0]  # u64
+        elif vtype == 11: return struct.unpack('<q', self.f.read(8))[0]  # i64
+        elif vtype == 12: return struct.unpack('<d', self.f.read(8))[0]  # f64
+        return None
+
+    def read_tensor_data(self, idx):
+        """Read raw bytes of tensor data from file."""
+        t = self.tensors[idx]
+        nelem = 1
+        for d in t['ne']: nelem *= d
+
+        # Compute byte size based on type
+        type_sizes = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 8: 2}  # F16=8
+        elem_sz = type_sizes.get(t['type'], 4)
+        nbytes = nelem * elem_sz
+
+        self.f.seek(self.data_start + t['offset'])
+        return self.f.read(nbytes), t['ne'], t['type']
+
+    def close(self):
+        self.f.close()
 
 def main():
     ap = argparse.ArgumentParser()
@@ -14,33 +96,31 @@ def main():
     args = ap.parse_args()
     t0 = time.time()
 
+    # Load C quantization library
     lib = ctypes.CDLL(args.lib)
     lib.quantize_to_type.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_float), ctypes.c_void_p, ctypes.c_int64, ctypes.c_int64]
     lib.quantize_to_type.restype = ctypes.c_size_t
     lib.get_quantized_size.argtypes = [ctypes.c_int, ctypes.c_int64, ctypes.c_int64]
     lib.get_quantized_size.restype = ctypes.c_size_t
     lib.get_block_size.argtypes = [ctypes.c_int]
-    lib.get_block_size.restype = ctypes.c_int
-    lib.f16_to_f32.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_float), ctypes.c_int64]
     lib.init_quant.argtypes = [ctypes.c_int]
 
-    Q = gguf.GGMLQuantizationType
+    # Quantization types (GGML type enum values)
+    F32 = 0; F16 = 1; Q4_0 = 2; Q4_1 = 3; Q5_0 = 6; Q5_1 = 7; Q8_0 = 8; Q2_K = 10
+    Q3_K = 11; Q4_K = 12; Q5_K = 13; Q6_K = 14
+
     if args.type == "q4_k_m":
-        sch = {'norm': Q.F32, 'embed': Q.F16, 'output': Q.Q6_K, 'attn': Q.Q4_K, 'ffn': Q.Q4_K, 'ffn_edge': Q.Q6_K, 'moe_gate': Q.F32}
+        sch = {'norm': F32, 'embed': F16, 'output': Q6_K, 'attn': Q4_K, 'ffn': Q4_K, 'ffn_edge': Q6_K, 'moe_gate': F32}
     elif args.type == "q8_0":
-        t = Q.Q8_0; sch = {'norm': Q.F32, 'embed': Q.F16, 'output': t, 'attn': t, 'ffn': t, 'ffn_edge': t, 'moe_gate': Q.F32}
+        sch = {'norm': F32, 'embed': F16, 'output': Q8_0, 'attn': Q8_0, 'ffn': Q8_0, 'ffn_edge': Q8_0, 'moe_gate': F32}
     elif args.type == "q4_0":
-        t = Q.Q4_0; sch = {'norm': Q.F32, 'embed': Q.F16, 'output': t, 'attn': t, 'ffn': t, 'ffn_edge': t, 'moe_gate': Q.F32}
+        sch = {'norm': F32, 'embed': F16, 'output': Q4_0, 'attn': Q4_0, 'ffn': Q4_0, 'ffn_edge': Q4_0, 'moe_gate': F32}
     elif args.type == "q6_k":
-        t = Q.Q6_K; sch = {'norm': Q.F32, 'embed': Q.F16, 'output': t, 'attn': t, 'ffn': t, 'ffn_edge': t, 'moe_gate': Q.F32}
+        sch = {'norm': F32, 'embed': F16, 'output': Q6_K, 'attn': Q6_K, 'ffn': Q6_K, 'ffn_edge': Q6_K, 'moe_gate': F32}
 
-    # Map Q enum to int values for C library
-    QI = {Q.F32: 0, Q.F16: 1, Q.Q4_0: 2, Q.Q8_0: 8, Q.Q4_K: 12, Q.Q6_K: 14}
-    # Actually, let me use the actual enum integer values
-    def q_int(q):
-        return int(q)
+    n_layers = 32
 
-    def classify(name, n_layers):
+    def classify(name):
         if "_norm" in name or "norm." in name or ".bias" in name: return 'norm'
         if "moe_gate" in name: return 'moe_gate'
         if "token_embd" in name or "embed" in name: return 'embed'
@@ -55,134 +135,130 @@ def main():
         if "output.weight" in name: return 'output'
         return 'attn'
 
+    # ── Read source GGUF header ──
     print(f"Reading: {args.input}", flush=True)
-    reader = gguf.GGUFReader(args.input)
+    hdr = GGUFHeader(args.input)
+    n_layers = hdr.kv.get('diffuse.block_count', (0, 32))[1]
+    print(f"  {hdr.n_tensors} tensors, {n_layers} layers", flush=True)
 
-    # Get n_layers
-    n_layers = 32
-    bc = reader.fields.get("diffuse.block_count")
-    if bc and len(bc.parts) > 0:
-        n_layers = int(bc.parts[-1][0])  # last part is the value
-
-    tensors = list(reader.tensors)
-    n_tensors = len(tensors)
-    print(f"  {n_tensors} tensors, {n_layers} layers", flush=True)
-
+    # ── Build output via gguf.GGUFWriter ──
+    import gguf
     writer = gguf.GGUFWriter(args.output, "diffuse")
 
     # Copy KV metadata
-    for fname, field in reader.fields.items():
-        if not field.types: continue
-        ft = field.types[0]
+    for key, (vtype, val) in hdr.kv.items():
         try:
-            if ft == gguf.GGUFValueType.UINT32:
-                writer.add_uint32(fname, int(field.parts[-1][0]))
-            elif ft == gguf.GGUFValueType.FLOAT32:
-                writer.add_float32(fname, float(field.parts[-1][0]))
-            elif ft == gguf.GGUFValueType.STRING:
-                # String is in parts as bytes
-                raw = bytes(field.parts[-1])
-                writer.add_string(fname, raw.decode('utf-8', errors='replace'))
-            elif ft == gguf.GGUFValueType.BOOL:
-                writer.add_bool(fname, bool(field.parts[-1][0]))
-            elif ft == gguf.GGUFValueType.INT32:
-                writer.add_uint32(fname, int(field.parts[-1][0]))
-            elif ft == gguf.GGUFValueType.ARRAY:
-                if fname == "tokenizer.ggml.tokens":
-                    vals = [v.decode() if isinstance(v, bytes) else str(v) for v in field.parts[1:]]
-                    writer.add_token_list(vals)
-                elif fname == "tokenizer.ggml.token_type":
-                    writer.add_token_types([int(v) for v in field.parts[1:]])
-                elif fname == "tokenizer.ggml.scores":
-                    writer.add_token_scores([float(v) for v in field.parts[1:]])
-                elif fname == "tokenizer.ggml.merges":
-                    vals = [v.decode() if isinstance(v, bytes) else str(v) for v in field.parts[1:]]
-                    writer.add_token_merges(vals)
+            if vtype == 4: writer.add_uint32(key, int(val))
+            elif vtype == 5: writer.add_uint32(key, int(val))
+            elif vtype == 6: writer.add_float32(key, float(val))
+            elif vtype == 8: writer.add_string(key, str(val))
+            elif vtype == 7: writer.add_bool(key, bool(val))
+            elif vtype == 9:  # array
+                if key == "tokenizer.ggml.tokens": writer.add_token_list(list(val))
+                elif key == "tokenizer.ggml.token_type": writer.add_token_types(list(val))
+                elif key == "tokenizer.ggml.scores": writer.add_token_scores(list(val))
+                elif key == "tokenizer.ggml.merges": writer.add_token_merges(list(val))
         except Exception:
             pass
 
     print(f"KV copied ({time.time()-t0:.0f}s)", flush=True)
 
-    # Add tensor info
+    # ── Add tensor info ──
     plan = []
-    for t in tensors:
-        name = t.name.decode() if isinstance(t.name, bytes) else t.name
-        tc = classify(name, n_layers)
-        dst_raw = sch[tc]
-        src_raw = t.tensor_type
-        if src_raw == dst_raw: dst_raw = src_raw
+    for i in range(hdr.n_tensors):
+        t = hdr.tensors[i]
+        name = t['name']
+        src_type = t['type']
+        tc = classify(name)
+        dst_type = sch[tc]
+        if dst_type >= src_type and not (dst_type >= 10):  # don't upcast non-quantized
+            dst_type = src_type
 
-        shape = tuple(t.shape)
-        nelem = int(np.prod(shape))
+        ne = t['ne']
+        shape = tuple(reversed(ne))  # GGML stores ne reversed from numpy
+        nelem = 1
+        for d in ne: nelem *= d
 
-        if dst_raw == Q.F32:
+        if dst_type == F32:
             dst_nb = nelem * 4; np_dt = np.float32
-        elif dst_raw == Q.F16:
+        elif dst_type == F16:
             dst_nb = nelem * 2; np_dt = np.float16
         else:
-            npr = shape[-1]; nr = nelem // npr
-            dst_nb = lib.get_quantized_size(q_int(dst_raw), ctypes.c_int64(nr), ctypes.c_int64(npr))
+            npr = ne[0]; nr = nelem // npr
+            dst_nb = lib.get_quantized_size(dst_type, ctypes.c_int64(nr), ctypes.c_int64(npr))
             np_dt = np.float32
 
-        writer.add_tensor_info(name, shape, np_dt, dst_nb, raw_dtype=dst_raw)
-        plan.append((name, src_raw, dst_raw, shape, nelem, t.data, dst_nb))
+        raw_dt_map = {F32: gguf.GGMLQuantizationType.F32, F16: gguf.GGMLQuantizationType.F16,
+                      Q4_K: gguf.GGMLQuantizationType.Q4_K, Q6_K: gguf.GGMLQuantizationType.Q6_K,
+                      Q8_0: gguf.GGMLQuantizationType.Q8_0, Q4_0: gguf.GGMLQuantizationType.Q4_0}
+        writer.add_tensor_info(name, shape, np_dt, dst_nb, raw_dtype=raw_dt_map.get(dst_type, gguf.GGMLQuantizationType.F16))
+        plan.append((name, src_type, dst_type, ne, nelem, i, dst_nb))
 
     print(f"Writing header ({time.time()-t0:.0f}s)...", flush=True)
     writer.write_header_to_file()
     writer.write_kv_data_to_file()
     writer.write_ti_data_to_file()
 
-    # Process tensors
+    # Init quantization tables
+    for dt in set(p[2] for p in plan):
+        if dt >= 10: lib.init_quant(dt)
+
+    # ── Process tensors ──
     print(f"Processing {len(plan)} tensors ({time.time()-t0:.0f}s)...", flush=True)
     total_src = 0; total_dst = 0; n_q = 0; n_k = 0
 
-    for dt in set(p[2] for p in plan):
-        if dt != Q.F32 and dt != Q.F16:
-            lib.init_quant(q_int(dt))
+    for idx, (name, src_type, dst_type, ne, nelem, ti_idx, dst_nb) in enumerate(plan):
+        # Read raw data from file (not mmap!)
+        raw_data, raw_ne, raw_type = hdr.read_tensor_data(ti_idx)
 
-    for idx, (name, src_raw, dst_raw, shape, nelem, data_ref, dst_nb) in enumerate(plan):
-        if src_raw == dst_raw:
+        if src_type == dst_type:
             # Keep as-is
-            dt_size = {Q.F32: 4, Q.F16: 2}.get(src_raw, 1)
-            if src_raw == Q.F32:
-                arr = np.frombuffer(data_ref, dtype=np.float32).reshape(shape)
-            elif src_raw == Q.F16:
-                arr = np.frombuffer(data_ref, dtype=np.float16).reshape(shape)
+            if src_type == F32:
+                arr = np.frombuffer(raw_data, dtype=np.float32)
+            elif src_type == F16:
+                arr = np.frombuffer(raw_data, dtype=np.float16)
             else:
-                arr = np.frombuffer(data_ref, dtype=np.uint8)
-            writer.write_tensor_data(np.array(arr, copy=True))
-            total_src += nelem * dt_size; total_dst += nelem * dt_size; n_k += 1
-            del arr
+                arr = np.frombuffer(raw_data, dtype=np.uint8)
+            writer.write_tensor_data(np.ascontiguousarray(arr))
+            total_src += len(raw_data); total_dst += len(raw_data); n_k += 1
+            del raw_data, arr
         else:
-            # Dequantize to F32
-            if src_raw == Q.F16:
-                # data_ref is a numpy float16 memmap — use directly
-                f32 = data_ref.astype(np.float32).ravel()
-            elif src_raw == Q.F32:
-                f32 = data_ref.astype(np.float32).ravel().copy()
+            # Dequantize
+            if src_type == F16:
+                f16 = np.frombuffer(raw_data, dtype=np.float16)
+                # Chunk the conversion to avoid memory spikes
+                CHUNK = 4 * 1024 * 1024  # 4M elements
+                f32 = np.empty(nelem, dtype=np.float32)
+                for off in range(0, nelem, CHUNK):
+                    n = min(CHUNK, nelem - off)
+                    f32[off:off+n] = f16[off:off+n].astype(np.float32)
+                del f16
+            elif src_type == F32:
+                f32 = np.frombuffer(raw_data, dtype=np.float32).copy()
             else:
                 f32 = None
 
+            del raw_data
+
             if f32 is None:
-                writer.write_tensor_data(np.frombuffer(data_ref, dtype=np.uint8, copy=True))
-                total_src += len(data_ref); total_dst += len(data_ref); n_k += 1
                 continue
 
-            if dst_raw == Q.F32:
-                writer.write_tensor_data(f32.reshape(shape))
+            if dst_type == F32:
+                writer.write_tensor_data(f32)
                 total_dst += nelem * 4; n_k += 1
-            elif dst_raw == Q.F16:
-                writer.write_tensor_data(f32.astype(np.float16).reshape(shape))
+            elif dst_type == F16:
+                writer.write_tensor_data(f32.astype(np.float16))
                 total_dst += nelem * 2; n_k += 1
             else:
-                npr = shape[-1]; nr = nelem // npr
-                blk = lib.get_block_size(q_int(dst_raw))
+                # Quantize via C library
+                npr = ne[0]; nr = nelem // npr
+                blk = lib.get_block_size(dst_type)
                 if npr % blk != 0:
-                    writer.write_tensor_data(f32.astype(np.float16).reshape(shape))
+                    writer.write_tensor_data(f32.astype(np.float16))
                     total_dst += nelem * 2; n_k += 1; del f32; continue
 
                 out_buf = ctypes.create_string_buffer(dst_nb)
-                actual = lib.quantize_to_type(q_int(dst_raw),
+                actual = lib.quantize_to_type(dst_type,
                     f32.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
                     out_buf, ctypes.c_int64(nr), ctypes.c_int64(npr))
 
@@ -196,6 +272,7 @@ def main():
         if (idx + 1) % 20 == 0:
             print(f"  [{idx+1}/{len(plan)}] ({time.time()-t0:.0f}s)", flush=True)
 
+    hdr.close()
     writer.close()
     total = time.time() - t0
     sz = os.path.getsize(args.output) / 1e9
