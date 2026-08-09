@@ -152,6 +152,8 @@ diffuse_model * diffuse_model_load_impl(const std::string & path, int n_threads)
         model->norm_topk_prob    = get_u32_multi(gctx, "norm_topk_prob", 1, false);
         model->n_group           = get_u32_multi(gctx, "n_group", 8, false);
         model->topk_group        = get_u32_multi(gctx, "topk_group", 4, false);
+        model->expert_capacity   = get_u32_multi(gctx, "expert_capacity", 48, false);
+        model->moe_block_size    = get_u32_multi(gctx, "moe_block_size", hp.block_length ? hp.block_length : 32, false);
         model->delete_token_id   = get_u32_multi(gctx, "delete_token_id", 0, false);
         model->split_token_id    = get_u32_multi(gctx, "split_token_id", 0, false);
 

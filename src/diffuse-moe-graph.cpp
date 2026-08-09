@@ -19,17 +19,7 @@ static struct ggml_tensor * ensure_f32_moe(struct ggml_context * ctx, struct ggm
 static struct ggml_tensor * build_block_causal_mask(
         struct ggml_context * ctx,
         int n_tokens,
-        int block_length,
-        int n_prompt) {
-
-    // Block ids: the whole prompt is block 0 (fully bidirectional within itself),
-    // then generation blocks tile the span after it. Tiling from absolute 0
-    // instead would split the prompt across blocks and stop its own tokens from
-    // attending to each other.
-    auto block_id = [&](int i) {
-        if (i < n_prompt) return 0;
-        return 1 + (i - n_prompt) / block_length;
-    };
+        int block_length) {
 
     // Mask shape for flash_attn_ext: [n_kv, n_batch, ne32, ne33] = [kv_len, q_len, 1, 1].
     // flash_attn_ext reads the mask as F16 (ggml-cpu/ops.cpp), so it MUST be F16 — an F32
@@ -50,10 +40,12 @@ static struct ggml_tensor * build_block_causal_mask(
     } else {
         // Block-causal: query i can attend to key j iff block_id(i) >= block_id(j).
         // Row-major data[q*ne0 + kv], ne0 = kv_len, so data[i*n_tokens + j] = mask[query i][key j].
+        // Blocks tile from absolute position 0, matching the reference
+        // generate(): tril(ones(n_blocks)) repeat_interleave'd by block_length.
         for (int i = 0; i < n_tokens; i++) {
-            int block_i = block_id(i);
+            int block_i = i / block_length;
             for (int j = 0; j < n_tokens; j++) {
-                int block_j = block_id(j);
+                int block_j = j / block_length;
                 mask_data[i * n_tokens + j] = (block_i >= block_j) ? zero : neg_inf;
             }
         }
@@ -112,9 +104,8 @@ static struct ggml_cgraph * diffuse_build_graph_moe(
         for (int i = 0; i < N; i++) pos_data[i] = i;
     }
 
-    // Block-causal attention mask (clamped: n_prompt may exceed this window on prefill)
-    struct ggml_tensor * attn_mask = build_block_causal_mask(ctx, N, block_len,
-                                                             std::min(dctx->n_prompt, N));
+    // Block-causal attention mask
+    struct ggml_tensor * attn_mask = build_block_causal_mask(ctx, N, block_len);
 
     // ── Embedding ──────────────────────────────────────────────
     struct ggml_tensor * cur = ggml_get_rows(ctx, model.tok_embd, inp_tokens);
@@ -192,14 +183,16 @@ static struct ggml_cgraph * diffuse_build_graph_moe(
             cur = ggml_mul(ctx, g, u);
             cur = ggml_mul_mat(ctx, ensure_f32_moe(ctx, ml.ffn_down), cur);
         } else {
-            // ── MoE layer (LLaDA2 / Ling — DeepSeek-V3 style group-limited routing) ──
-            // Mirrors llama.cpp build_moe_ffn: sigmoid gating, bias-corrected group
-            // selection (choice only), unbiased weights, normalize + scale, weighted
-            // sum of the top-k experts, plus a shared expert on the same input.
+            // ── MoE layer (LLaDA2 — block routing) ──────────────────
+            // Follows LLaDA2MoeGate: sigmoid gating, bias-corrected *selection*,
+            // per-block expert capacity, then per-token top-k inside the allowed
+            // set. Weights come from the unbiased probs, renormalized and scaled.
+            // Note: n_group/topk_group in config.json are vestigial — the
+            // reference model does not use DeepSeek-style group routing.
             const int n_experts = (int)model.n_experts;
             const int top_k     = (int)model.n_experts_per_tok;
-            const int n_group   = (int)model.n_group;
-            const int topk_grp  = (int)model.topk_group;
+            const int cap       = (int)model.expert_capacity;
+            const int blk_sz    = (int)model.moe_block_size;
 
             struct ggml_tensor * moe_in = cur;  // [n_embd, N] — input to routed AND shared experts
 
@@ -213,24 +206,43 @@ static struct ggml_cgraph * diffuse_build_graph_moe(
                 sel = ggml_add(ctx, probs, ensure_f32_moe(ctx, ml.gate_bias));
             }
 
-            // Group-limited routing: keep only experts in the top `topk_grp` groups,
-            // where a group's score is the sum of its top-2 experts' selection scores.
-            const bool use_groups = (n_group > 1) && (topk_grp > 0) && (topk_grp < n_group)
-                                    && (n_experts % n_group == 0) && (n_experts / n_group >= 2);
-            if (use_groups) {
-                const int eg = n_experts / n_group;                                        // experts per group
-                struct ggml_tensor * selg = ggml_reshape_3d(ctx, sel, eg, n_group, N);      // [eg, n_group, N]
-                struct ggml_tensor * g2   = ggml_top_k(ctx, selg, 2);                       // [2, n_group, N] idx
-                struct ggml_tensor * g2v  = ggml_get_rows(ctx,
-                        ggml_reshape_4d(ctx, selg, 1, eg, n_group, N), g2);                 // [1, 2, n_group, N] vals
-                struct ggml_tensor * gscore = ggml_sum_rows(ctx,
-                        ggml_reshape_3d(ctx, g2v, 2, n_group, N));                          // [1, n_group, N]
-                gscore = ggml_reshape_2d(ctx, gscore, n_group, N);                          // [n_group, N]
-                struct ggml_tensor * gsel   = ggml_top_k(ctx, gscore, topk_grp);           // [topk_grp, N] group idx
-                struct ggml_tensor * selg_k = ggml_get_rows(ctx, selg, gsel);              // [eg, topk_grp, N]
-                sel = ggml_set_rows(ctx,
-                        ggml_fill(ctx, selg, -INFINITY), selg_k, gsel);                    // mask non-selected groups
-                sel = ggml_reshape_2d(ctx, sel, n_experts, N);                             // [n_experts, N]
+            // Block routing: per block of blk_sz tokens, take each expert's max
+            // score over the block, keep the top `cap` experts, and forbid the
+            // rest for every token in that block.
+            const bool use_block_routing =
+                blk_sz > 1 && cap > 0 && cap < n_experts && N % blk_sz == 0;
+            if (use_block_routing) {
+                const int n_blk = N / blk_sz;
+                struct ggml_tensor * sel3 = ggml_reshape_3d(ctx, sel, n_experts, blk_sz, n_blk);
+
+                // max over the token axis; ggml has no elementwise max, so fold
+                // with max(a,b) = b + relu(a-b)
+                struct ggml_tensor * bmax = ggml_cont(ctx,
+                        ggml_view_2d(ctx, sel3, n_experts, n_blk, sel3->nb[2], 0));
+                for (int t = 1; t < blk_sz; t++) {
+                    struct ggml_tensor * s = ggml_cont(ctx,
+                            ggml_view_2d(ctx, sel3, n_experts, n_blk, sel3->nb[2], (size_t)t * sel3->nb[1]));
+                    bmax = ggml_add(ctx, s, ggml_relu(ctx, ggml_sub(ctx, bmax, s)));
+                }                                                              // [n_experts, n_blk]
+
+                // Threshold = the cap-th largest per block (argsort_top_k is sorted desc)
+                struct ggml_tensor * cidx = ggml_argsort_top_k(ctx, bmax, cap);        // [cap, n_blk]
+                struct ggml_tensor * cval = ggml_get_rows(ctx,
+                        ggml_reshape_3d(ctx, bmax, 1, n_experts, n_blk), cidx);        // [1, cap, n_blk]
+                struct ggml_tensor * thr = ggml_cont(ctx,
+                        ggml_view_2d(ctx, cval, 1, n_blk, cval->nb[2], (size_t)(cap - 1) * cval->nb[1]));
+
+                // allowed = bmax >= thr → additive 0, otherwise a large negative
+                // (finite, so it never turns into NaN downstream)
+                const float NEG = -1e30f;
+                struct ggml_tensor * keep = ggml_step(ctx,
+                        ggml_sub(ctx, bmax, ggml_scale_bias(ctx, thr, 1.0f, -1e-6f)));  // [n_experts, n_blk]
+                struct ggml_tensor * bias = ggml_scale_bias(ctx, keep, -NEG, NEG);      // 1→0, 0→NEG
+
+                // Broadcast each block's mask across its tokens → [n_experts, N]
+                bias = ggml_repeat_4d(ctx, ggml_reshape_3d(ctx, bias, n_experts, 1, n_blk),
+                                      n_experts, blk_sz, n_blk, 1);
+                sel  = ggml_add(ctx, sel, ggml_reshape_2d(ctx, bias, n_experts, N));
             }
 
             // Final expert selection + gating weights (weights gathered from UNBIASED probs)

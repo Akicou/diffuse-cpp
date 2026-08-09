@@ -76,6 +76,7 @@ def main():
     rope_theta=c("rope_theta",3e6); rms_eps=c("rms_norm_eps",1e-6); rotary_dim=c("rotary_dim",head_dim)
     use_qk=c("use_qk_norm"); routed_sf=c("routed_scaling_factor",1.0); block_size=c("block_size",32)
     tie_emb=c("tie_word_embeddings"); n_group=c("n_group",8); topk_group=c("topk_group",4)
+    expert_cap=c("expert_capacity",48)
     pad_id=c("pad_token_id",156892)
     print(f"LLaDA2.2: {n_layer}L {n_experts}E", flush=True)
 
@@ -133,6 +134,7 @@ def main():
         ("diffuse.first_k_dense_replace",first_k),("diffuse.norm_topk_prob",1),
         ("diffuse.block_length",block_size),("diffuse.moe_block_size",block_size),
         ("diffuse.n_group",n_group),("diffuse.topk_group",topk_group),
+        ("diffuse.expert_capacity",expert_cap),
         ("diffuse.eos_token_id",pad_id),("diffuse.delete_token_id",156930),
         ("diffuse.split_token_id",156931)]:
         writer.add_uint32(k,v)
@@ -161,7 +163,14 @@ def main():
     writer.add_uint32("tokenizer.ggml.mask_token_id", mask_id)
     writer.add_bool("tokenizer.ggml.add_bos_token", bool(tc.get("add_bos_token",False)))
     writer.add_bool("tokenizer.ggml.add_eos_token", bool(tc.get("add_eos_token",False)))
-    if "chat_template" in tc: writer.add_string("tokenizer.chat_template", tc["chat_template"])
+    # Newer HF checkpoints ship the template as a sibling file rather than a
+    # tokenizer_config.json key — LLaDA2.2 does exactly that.
+    ct = tc.get("chat_template")
+    if not ct:
+        ct_path = os.path.join(model_dir, "chat_template.jinja")
+        if os.path.exists(ct_path):
+            with open(ct_path, encoding="utf-8") as f: ct = f.read()
+    if ct: writer.add_string("tokenizer.chat_template", ct)
     print(f"  {len(tl)} tokens", flush=True)
 
     # Add tensor info for all tensors

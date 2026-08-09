@@ -112,6 +112,8 @@ struct diffuse_model {
     bool     norm_topk_prob     = true;
     uint32_t n_group            = 8;
     uint32_t topk_group         = 4;
+    uint32_t expert_capacity    = 48;   // experts allowed per 32-token routing block
+    uint32_t moe_block_size     = 32;   // token block size used by the MoE router
     uint32_t delete_token_id    = 0;
     uint32_t split_token_id     = 0;
 
@@ -138,10 +140,6 @@ struct diffuse_context {
 
     void  * compute_buf     = nullptr;
     size_t compute_buf_size = 0;
-
-    // Prompt length for the block-causal mask: the prompt is one fully-visible
-    // region and generation blocks tile the span after it. 0 = tile from 0.
-    int    n_prompt         = 0;
 
     bool sched_initialized = false;
 };

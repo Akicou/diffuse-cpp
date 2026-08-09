@@ -117,18 +117,22 @@ static std::vector<int32_t> generate_block_diffusion(
 
     int prompt_len = (int)prompt_tokens.size();
 
-    // Generation blocks tile the region *after* the prompt. Aligning them to
-    // absolute position 0 instead would strand the tail of the prompt's partial
-    // block as mask tokens that are never denoised, poisoning the context.
-    int total_gen    = ((n_generate + block_len - 1) / block_len) * block_len;
-    int num_blocks   = total_gen / block_len;
-    int total_length = prompt_len + total_gen;
+    // Blocks tile from absolute position 0 (matches the reference generate(),
+    // and keeps every fed window a multiple of block_len, which the MoE block
+    // router requires).
+    int num_blocks   = (prompt_len + n_generate + block_len - 1) / block_len;
+    int total_length = num_blocks * block_len;
 
     // Build token sequence: prompt + mask tokens for generation
     std::vector<int32_t> seq(total_length, mask_id);
-    for (int i = 0; i < prompt_len; i++) {
+    for (int i = 0; i < prompt_len && i < total_length; i++) {
         seq[i] = prompt_tokens[i];
     }
+
+    // Floor, not ceil: the block that straddles the end of the prompt still has
+    // mask positions to denoise. Rounding up skips it and leaves them masked
+    // forever, which poisons the context for every later block.
+    int prefill_blocks = prompt_len / block_len;
 
     // Denoising schedule
     int steps = std::min(params.n_steps, block_len);
@@ -136,21 +140,17 @@ static std::vector<int32_t> generate_block_diffusion(
 
     std::mt19937 rng(params.seed);
 
-    DIFFUSE_LOG("block diffusion: %d blocks, prompt=%d, block_len=%d, steps=%d, threshold=%.2f, editing=%s",
-                num_blocks, prompt_len, block_len, steps, params.threshold,
+    DIFFUSE_LOG("block diffusion: %d blocks (prefill=%d), prompt=%d, block_len=%d, steps=%d, threshold=%.2f, editing=%s",
+                num_blocks, prefill_blocks, prompt_len, block_len, steps, params.threshold,
                 editing ? "yes" : "no");
 
     using clk = std::chrono::steady_clock;
     auto gen_start = clk::now();
     double total_forward_ms = 0.0;
 
-    // The graph builds its block-causal mask relative to the prompt: the whole
-    // prompt is one fully-visible region, generation blocks follow it.
-    ctx->n_prompt = prompt_len;
-
     // Process blocks left to right
-    for (int blk = 0; blk < num_blocks; blk++) {
-        int block_start = prompt_len + blk * block_len;
+    for (int blk = prefill_blocks; blk < num_blocks; blk++) {
+        int block_start = blk * block_len;
         int cur_window_end = std::min(block_start + block_len, total_length);
 
         // Token buffer for this window (grows as we process more blocks)
@@ -284,7 +284,7 @@ static std::vector<int32_t> generate_block_diffusion(
     // ── Finalize ───────────────────────────────────────────────
     auto gen_end = clk::now();
     double total_ms = std::chrono::duration<double, std::milli>(gen_end - gen_start).count();
-    int actual_gen = std::min(total_gen, total_length - prompt_len);
+    int actual_gen = std::min(n_generate, total_length - prompt_len);
 
     DIFFUSE_LOG("generation complete: %d tokens in %.0fms (%.1f tok/s, fwd=%.0fms)",
                 actual_gen, total_ms, 1000.0 * actual_gen / total_ms, total_forward_ms);
