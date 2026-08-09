@@ -15,8 +15,8 @@ class GGUFHeader:
         self.f = open(path, 'rb')
         magic = self.f.read(4)
         self.version = struct.unpack('<I', self.f.read(4))[0]
-        n_kv = struct.unpack('<Q', self.f.read(8))[0]
         n_tensors = struct.unpack('<Q', self.f.read(8))[0]
+        n_kv = struct.unpack('<Q', self.f.read(8))[0]
         self.n_kv = n_kv
         self.n_tensors = n_tensors
 
