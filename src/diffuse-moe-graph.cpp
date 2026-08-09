@@ -1,6 +1,7 @@
 #include "diffuse-graph.h"
 #include "diffuse-backend.h"
 
+#include <algorithm>
 #include <cmath>
 
 // ── Helper ──
@@ -18,7 +19,17 @@ static struct ggml_tensor * ensure_f32_moe(struct ggml_context * ctx, struct ggm
 static struct ggml_tensor * build_block_causal_mask(
         struct ggml_context * ctx,
         int n_tokens,
-        int block_length) {
+        int block_length,
+        int n_prompt) {
+
+    // Block ids: the whole prompt is block 0 (fully bidirectional within itself),
+    // then generation blocks tile the span after it. Tiling from absolute 0
+    // instead would split the prompt across blocks and stop its own tokens from
+    // attending to each other.
+    auto block_id = [&](int i) {
+        if (i < n_prompt) return 0;
+        return 1 + (i - n_prompt) / block_length;
+    };
 
     // Mask shape for flash_attn_ext: [n_kv, n_batch, ne32, ne33] = [kv_len, q_len, 1, 1].
     // flash_attn_ext reads the mask as F16 (ggml-cpu/ops.cpp), so it MUST be F16 — an F32
@@ -40,9 +51,9 @@ static struct ggml_tensor * build_block_causal_mask(
         // Block-causal: query i can attend to key j iff block_id(i) >= block_id(j).
         // Row-major data[q*ne0 + kv], ne0 = kv_len, so data[i*n_tokens + j] = mask[query i][key j].
         for (int i = 0; i < n_tokens; i++) {
-            int block_i = i / block_length;
+            int block_i = block_id(i);
             for (int j = 0; j < n_tokens; j++) {
-                int block_j = j / block_length;
+                int block_j = block_id(j);
                 mask_data[i * n_tokens + j] = (block_i >= block_j) ? zero : neg_inf;
             }
         }
@@ -101,8 +112,9 @@ static struct ggml_cgraph * diffuse_build_graph_moe(
         for (int i = 0; i < N; i++) pos_data[i] = i;
     }
 
-    // Block-causal attention mask
-    struct ggml_tensor * attn_mask = build_block_causal_mask(ctx, N, block_len);
+    // Block-causal attention mask (clamped: n_prompt may exceed this window on prefill)
+    struct ggml_tensor * attn_mask = build_block_causal_mask(ctx, N, block_len,
+                                                             std::min(dctx->n_prompt, N));
 
     // ── Embedding ──────────────────────────────────────────────
     struct ggml_tensor * cur = ggml_get_rows(ctx, model.tok_embd, inp_tokens);

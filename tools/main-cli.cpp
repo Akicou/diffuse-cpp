@@ -117,6 +117,7 @@ int main(int argc, char ** argv) {
     sp.threshold      = threshold;
     sp.eos_early_stop = eos_early_stop;
     sp.enable_editing = editing;
+    sp.stop_token_2   = diffuse_token_id(tokenizer, "<|role_end|>");  // LLaDA2 turn end
 
     fprintf(stderr, "Generating %d tokens...\n", n_generate);
 

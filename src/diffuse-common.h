@@ -139,5 +139,9 @@ struct diffuse_context {
     void  * compute_buf     = nullptr;
     size_t compute_buf_size = 0;
 
+    // Prompt length for the block-causal mask: the prompt is one fully-visible
+    // region and generation blocks tile the span after it. 0 = tile from 0.
+    int    n_prompt         = 0;
+
     bool sched_initialized = false;
 };

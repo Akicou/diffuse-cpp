@@ -117,23 +117,17 @@ static std::vector<int32_t> generate_block_diffusion(
 
     int prompt_len = (int)prompt_tokens.size();
 
-    // Round up to block boundary
-    int total_gen = ((n_generate + block_len - 1) / block_len) * block_len;
-    int num_blocks = (prompt_len + total_gen + block_len - 1) / block_len;
-    int total_length = num_blocks * block_len;
+    // Generation blocks tile the region *after* the prompt. Aligning them to
+    // absolute position 0 instead would strand the tail of the prompt's partial
+    // block as mask tokens that are never denoised, poisoning the context.
+    int total_gen    = ((n_generate + block_len - 1) / block_len) * block_len;
+    int num_blocks   = total_gen / block_len;
+    int total_length = prompt_len + total_gen;
 
     // Build token sequence: prompt + mask tokens for generation
     std::vector<int32_t> seq(total_length, mask_id);
-    for (int i = 0; i < prompt_len && i < total_length; i++) {
+    for (int i = 0; i < prompt_len; i++) {
         seq[i] = prompt_tokens[i];
-    }
-
-    int prefill_blocks = prompt_len / block_len;
-    if (prefill_blocks * block_len < prompt_len) {
-        // Prompt doesn't align to block boundary — pad with mask in the partial block
-        // Actually the prompt occupies its partial block; generation starts at next block
-        prefill_blocks = (prompt_len + block_len - 1) / block_len;
-        if (prefill_blocks == 0) prefill_blocks = 1;
     }
 
     // Denoising schedule
@@ -142,19 +136,22 @@ static std::vector<int32_t> generate_block_diffusion(
 
     std::mt19937 rng(params.seed);
 
-    DIFFUSE_LOG("block diffusion: %d blocks (prefill=%d), block_len=%d, steps=%d, threshold=%.2f, editing=%s",
-                num_blocks, prefill_blocks, block_len, steps, params.threshold,
+    DIFFUSE_LOG("block diffusion: %d blocks, prompt=%d, block_len=%d, steps=%d, threshold=%.2f, editing=%s",
+                num_blocks, prompt_len, block_len, steps, params.threshold,
                 editing ? "yes" : "no");
 
     using clk = std::chrono::steady_clock;
     auto gen_start = clk::now();
     double total_forward_ms = 0.0;
 
+    // The graph builds its block-causal mask relative to the prompt: the whole
+    // prompt is one fully-visible region, generation blocks follow it.
+    ctx->n_prompt = prompt_len;
+
     // Process blocks left to right
-    for (int blk = prefill_blocks; blk < num_blocks; blk++) {
-        int block_start = blk * block_len;
-        int window_end = block_start + block_len;  // current window end
-        int cur_window_end = std::min(window_end, total_length);
+    for (int blk = 0; blk < num_blocks; blk++) {
+        int block_start = prompt_len + blk * block_len;
+        int cur_window_end = std::min(block_start + block_len, total_length);
 
         // Token buffer for this window (grows as we process more blocks)
         // We only feed tokens up to the current block's end
@@ -260,10 +257,11 @@ static std::vector<int32_t> generate_block_diffusion(
             }
         }
 
-        // Check for EOS in completed block
-        if (params.eos_early_stop && eos_id > 0) {
+        // Check for EOS in completed block. LLaDA2 ends an assistant turn with
+        // <|role_end|>, which is a separate id from <|endoftext|>, so both stop.
+        if (params.eos_early_stop && (eos_id > 0 || params.stop_token_2 >= 0)) {
             for (int i = block_start; i < cur_window_end; i++) {
-                if (seq[i] == eos_id) {
+                if (seq[i] == eos_id || (params.stop_token_2 >= 0 && seq[i] == params.stop_token_2)) {
                     // Check all positions before EOS are unmasked
                     bool all_clear = true;
                     for (int j = prompt_len; j < i; j++) {

@@ -46,6 +46,7 @@ struct diffuse_sampler_params {
     float    threshold         = 0.95f;      // Confidence threshold for token commit
     bool     eos_early_stop    = true;       // Stop when EOS is committed and confirmed
     bool     enable_editing    = true;       // Levenshtein editing (DELETE/INSERT)
+    int32_t  stop_token_2      = -1;         // Extra stop id (e.g. <|role_end|>); -1 = unused
 };
 
 // ── Step callback ──────────────────────────────────────────────
@@ -85,3 +86,5 @@ std::vector<int32_t> diffuse_tokenize(diffuse_tokenizer * tok, const std::string
 std::string diffuse_detokenize(diffuse_tokenizer * tok, const std::vector<int32_t> & ids, bool skip_special = true);
 bool diffuse_tokenizer_ready(const diffuse_tokenizer * tok);
 size_t diffuse_tokenizer_size(const diffuse_tokenizer * tok);
+// Look up a token's id by its literal text; -1 if absent.
+int32_t diffuse_token_id(const diffuse_tokenizer * tok, const std::string & text);

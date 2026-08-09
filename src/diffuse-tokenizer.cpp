@@ -138,6 +138,19 @@ bool diffuse_tokenizer::load_from_gguf(struct gguf_context * gctx) {
         }
     }
 
+    // Collect special token literals so encode() can match them verbatim.
+    // Sorted longest-first so the longest match wins (e.g. <|tool_call_begin|>
+    // must win over any shorter token that prefixes it).
+    for (size_t i = 0; i < n_tokens; i++) {
+        if (id_to_token[i].empty()) continue;
+        if (id_to_type[i] == DIFFUSE_TOKEN_TYPE_CONTROL ||
+            id_to_type[i] == DIFFUSE_TOKEN_TYPE_USER_DEFINED) {
+            special_tokens.push_back(id_to_token[i]);
+        }
+    }
+    std::sort(special_tokens.begin(), special_tokens.end(),
+              [](const std::string & a, const std::string & b) { return a.size() > b.size(); });
+
     // Scores (optional)
     int64_t scores_kid = gguf_find_key(gctx, "tokenizer.ggml.scores");
     if (scores_kid >= 0) {
@@ -391,30 +404,53 @@ std::vector<int32_t> diffuse_tokenizer::encode(const std::string & text, bool ad
         result.push_back(bos_id);
     }
 
-    // Pre-tokenize
-    auto pre_tokens = pre_tokenize(text);
-
-    for (const auto & pre_tok : pre_tokens) {
-        // Byte-encode: convert each byte to its unicode character
-        std::string byte_encoded;
-        for (unsigned char c : pre_tok) {
-            byte_encoded += byte_to_unicode_str[c];
-        }
-
-        // Apply BPE merges
-        auto bpe_tokens = bpe(byte_encoded);
-
-        // Look up each BPE token in vocab
-        for (const auto & bt : bpe_tokens) {
-            auto it = token_to_id.find(bt);
-            if (it != token_to_id.end()) {
-                result.push_back(it->second);
-            } else if (unk_id >= 0) {
-                result.push_back(unk_id);
+    // BPE-encode a plain span of text (no special tokens inside)
+    auto encode_span = [&](const std::string & span) {
+        if (span.empty()) return;
+        for (const auto & pre_tok : pre_tokenize(span)) {
+            // Byte-encode: convert each byte to its unicode character
+            std::string byte_encoded;
+            for (unsigned char c : pre_tok) {
+                byte_encoded += byte_to_unicode_str[c];
             }
-            // If no UNK token and not in vocab, skip (shouldn't happen with byte fallback)
+
+            // Apply BPE merges
+            auto bpe_tokens = bpe(byte_encoded);
+
+            // Look up each BPE token in vocab
+            for (const auto & bt : bpe_tokens) {
+                auto it = token_to_id.find(bt);
+                if (it != token_to_id.end()) {
+                    result.push_back(it->second);
+                } else if (unk_id >= 0) {
+                    result.push_back(unk_id);
+                }
+                // If no UNK token and not in vocab, skip (shouldn't happen with byte fallback)
+            }
+        }
+    };
+
+    // Walk the text, emitting special tokens verbatim and BPE-ing the rest.
+    // Without this, chat markers like <|role_end|> get byte-encoded into
+    // subword fragments and the model never sees the control token.
+    size_t pos = 0, span_start = 0;
+    while (pos < text.size()) {
+        const std::string * hit = nullptr;
+        if (text[pos] == '<' || text[pos] == '[') {   // cheap gate: all specials start with these
+            for (const auto & st : special_tokens) {  // longest-first
+                if (text.compare(pos, st.size(), st) == 0) { hit = &st; break; }
+            }
+        }
+        if (hit) {
+            encode_span(text.substr(span_start, pos - span_start));
+            result.push_back(token_to_id.at(*hit));
+            pos += hit->size();
+            span_start = pos;
+        } else {
+            pos++;
         }
     }
+    encode_span(text.substr(span_start));
 
     // Add EOS if configured
     if (add_special && add_eos && eos_id >= 0) {
@@ -496,19 +532,29 @@ std::vector<int32_t> diffuse_apply_chat_template(
         const std::vector<diffuse_chat_message> & messages,
         bool add_generation_prompt) {
 
-    // Build the prompt text using ChatML format:
-    //   <|im_start|>system\n{content}<|im_end|>
-    //   <|im_start|>user\n{content}<|im_end|>
-    //   <|im_start|>assistant\n
+    // Pick the format from the vocabulary rather than assuming one.
+    // LLaDA2 / Ling (inclusionAI) use <role>NAME</role>...<|role_end|>. ChatML
+    // markers do not exist in that vocab, so emitting them produces byte-level
+    // garbage instead of control tokens and the model sees a corrupt prompt.
+    const bool ling = tok && tok->token_to_id.count("<|role_end|>") > 0;
 
     std::string prompt;
 
-    for (const auto & msg : messages) {
-        prompt += "<|im_start|>" + msg.role + "\n" + msg.content + "<|im_end|>\n";
-    }
-
-    if (add_generation_prompt) {
-        prompt += "<|im_start|>assistant\n";
+    if (ling) {
+        for (const auto & msg : messages) {
+            prompt += "<role>" + msg.role + "</role>" + msg.content + "<|role_end|>";
+        }
+        if (add_generation_prompt) {
+            prompt += "<role>assistant</role>";
+        }
+    } else {
+        // ChatML (Dream / Qwen2.5 backbone)
+        for (const auto & msg : messages) {
+            prompt += "<|im_start|>" + msg.role + "\n" + msg.content + "<|im_end|>\n";
+        }
+        if (add_generation_prompt) {
+            prompt += "<|im_start|>assistant\n";
+        }
     }
 
     return tok->encode(prompt, false);
@@ -586,4 +632,10 @@ bool diffuse_tokenizer_ready(const diffuse_tokenizer * tok) {
 
 size_t diffuse_tokenizer_size(const diffuse_tokenizer * tok) {
     return tok ? tok->size() : 0;
+}
+
+int32_t diffuse_token_id(const diffuse_tokenizer * tok, const std::string & text) {
+    if (!tok || !tok->initialized) return -1;
+    auto it = tok->token_to_id.find(text);
+    return it == tok->token_to_id.end() ? -1 : (int32_t)it->second;
 }

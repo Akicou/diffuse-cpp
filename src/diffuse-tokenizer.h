@@ -49,6 +49,11 @@ struct diffuse_tokenizer {
     // BPE merge ranks: pair of token strings → rank (lower = higher priority)
     std::map<std::pair<std::string, std::string>, int> bpe_ranks;
 
+    // Literal text of every control/user-defined token, longest first.
+    // encode() matches these before BPE so markers like <|role_end|> map to
+    // their own id instead of being shredded into byte-level pieces.
+    std::vector<std::string> special_tokens;
+
     // Model name ("gpt2", "llama", etc.)
     std::string model_name = "gpt2";
 
