@@ -146,10 +146,13 @@ static struct ggml_cgraph * diffuse_build_graph_moe(
             K = ggml_mul(ctx, K, ensure_f32_moe(ctx, ml.k_norm));
         }
 
-        // Partial RoPE: rotate first rotary_dim, pass through rest
+        // Partial RoPE: rotate first rotary_dim, pass through rest.
+        // NEOX mode: the reference uses rotate_half (split the rotary half in
+        // two, (-x2, x1)). Mode 0 would interleave pairs instead, which only
+        // matches if the QKV weights were permuted at conversion — ours are not.
         // ggml_rope_ext(ctx, a, pos, freq_factors, n_dims, mode, n_ctx_orig, n_freq_orig, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow)
-        Q = ggml_rope_ext(ctx, Q, inp_pos, nullptr, rotary_dim, 0, 0, rope_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
-        K = ggml_rope_ext(ctx, K, inp_pos, nullptr, rotary_dim, 0, 0, rope_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        Q = ggml_rope_ext(ctx, Q, inp_pos, nullptr, rotary_dim, GGML_ROPE_TYPE_NEOX, 0, rope_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        K = ggml_rope_ext(ctx, K, inp_pos, nullptr, rotary_dim, GGML_ROPE_TYPE_NEOX, 0, rope_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
 
         // Permute to flash-attn layout [head_dim, n_tokens, n_head].
         // flash_attn_ext broadcasts KV heads for GQA (query head h → kv head h/(n_head/n_head_kv)),

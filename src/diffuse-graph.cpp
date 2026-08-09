@@ -65,9 +65,11 @@ static struct ggml_cgraph * diffuse_build_graph_dense(
         K = ggml_reshape_3d(ctx, K, n_embd_head, n_head_kv, N);
         V = ggml_reshape_3d(ctx, V, n_embd_head, n_head_kv, N);
 
-        // RoPE (operates on [head_dim, n_head, n_tokens])
-        Q = ggml_rope_ext(ctx, Q, inp_pos, nullptr, n_embd_head, 0, 0, hp.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
-        K = ggml_rope_ext(ctx, K, inp_pos, nullptr, n_embd_head, 0, 0, hp.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        // RoPE (operates on [head_dim, n_head, n_tokens]).
+        // NEOX mode: HF applies rotate_half; our converter does not permute the
+        // Q/K weights, so the interleaved (mode 0) layout would not match.
+        Q = ggml_rope_ext(ctx, Q, inp_pos, nullptr, n_embd_head, GGML_ROPE_TYPE_NEOX, 0, hp.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        K = ggml_rope_ext(ctx, K, inp_pos, nullptr, n_embd_head, GGML_ROPE_TYPE_NEOX, 0, hp.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
 
         // Permute to flash-attn layout [head_dim, n_tokens, n_head].
         // flash_attn_ext broadcasts KV heads for GQA (query head h → kv head h/(n_head/n_head_kv)),
