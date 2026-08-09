@@ -1,6 +1,5 @@
 #include "diffuse-sampler.h"
 #include "diffuse-graph.h"
-#include "diffuse-cache.h"
 
 #include <algorithm>
 #include <numeric>
@@ -8,56 +7,309 @@
 #include <cmath>
 #include <chrono>
 
-// ── Masking schedule ───────────────────────────────────────────
-static int tokens_to_unmask(int step, int total_steps, int total_masked,
-                            diffuse_schedule schedule) {
-    float t0 = (float)step / total_steps;
-    float t1 = (float)(step + 1) / total_steps;
+// ═══════════════════════════════════════════════════════════════
+// Helpers
+// ═══════════════════════════════════════════════════════════════
 
-    float frac;
-    if (schedule == diffuse_schedule::COSINE) {
-        // Cosine schedule: more tokens unmasked in early steps
-        float cos0 = cosf(t0 * M_PI * 0.5f);
-        float cos1 = cosf(t1 * M_PI * 0.5f);
-        frac = (cos0 - cos1) / cos0;
-    } else {
-        // Linear: equal fraction each step
-        frac = 1.0f / (total_steps - step);
+// Token transfer schedule: how many tokens to commit per step
+// Matches dFactory's _get_num_transfer_tokens(block_length, steps)
+static std::vector<int> get_num_transfer_tokens(int block_length, int steps) {
+    if (steps == 0) return {};
+    std::vector<int> schedule(steps);
+    int base = block_length / steps;
+    int remainder = block_length % steps;
+    for (int i = 0; i < steps; i++) {
+        schedule[i] = base + (i < remainder ? 1 : 0);
     }
-
-    int n = (int)roundf(frac * total_masked);
-    if (n < 1 && total_masked > 0) n = 1;
-    return std::min(n, total_masked);
+    return schedule;
 }
 
-// ── Compute entropy of logit distribution ─────────────────────
-static float compute_entropy(const float * logits, int n_vocab) {
-    // Find max for numerical stability
+// Sample a token and its probability from logits
+// temperature=0 → argmax (deterministic)
+static void sample_token(const float * logits, int n_vocab, float temperature,
+                         uint32_t seed, std::mt19937 & rng,
+                         int & token_id, float & token_prob) {
+    if (temperature <= 0.0f) {
+        // Argmax
+        int best = 0;
+        float best_val = logits[0];
+        for (int v = 1; v < n_vocab; v++) {
+            if (logits[v] > best_val) {
+                best_val = logits[v];
+                best = v;
+            }
+        }
+        token_id = best;
+        // Compute probability via softmax
+        float max_val = best_val;
+        float sum = 0.0f;
+        for (int v = 0; v < n_vocab; v++) {
+            sum += expf(logits[v] - max_val);
+        }
+        token_prob = 1.0f / sum;  // prob of argmax = exp(0) / sum = 1/sum
+    } else {
+        // Temperature sampling
+        float max_val = logits[0];
+        for (int v = 1; v < n_vocab; v++) {
+            if (logits[v] > max_val) max_val = logits[v];
+        }
+        std::vector<float> probs(n_vocab);
+        float sum = 0.0f;
+        for (int v = 0; v < n_vocab; v++) {
+            probs[v] = expf((logits[v] - max_val) / temperature);
+            sum += probs[v];
+        }
+        for (int v = 0; v < n_vocab; v++) probs[v] /= sum;
+
+        std::discrete_distribution<int> dist(probs.begin(), probs.end());
+        token_id = dist(rng);
+        token_prob = probs[token_id];
+    }
+}
+
+// Compute softmax probability of the argmax token
+static float softmax_max_prob(const float * logits, int n_vocab) {
     float max_val = logits[0];
     for (int v = 1; v < n_vocab; v++) {
         if (logits[v] > max_val) max_val = logits[v];
     }
-
-    // Softmax + entropy in one pass
-    float sum_exp = 0.0f;
+    float sum = 0.0f;
     for (int v = 0; v < n_vocab; v++) {
-        sum_exp += expf(logits[v] - max_val);
+        sum += expf(logits[v] - max_val);
     }
-    float log_sum = logf(sum_exp);
-
-    float entropy = 0.0f;
-    for (int v = 0; v < n_vocab; v++) {
-        float log_p = (logits[v] - max_val) - log_sum;
-        float p = expf(log_p);
-        if (p > 1e-10f) {
-            entropy -= p * log_p;
-        }
-    }
-    return entropy;
+    return 1.0f / sum;
 }
 
-// ── Iterative unmasking sampler with inter-step caching ─────────
-std::vector<int32_t> diffuse_sample(
+// ═══════════════════════════════════════════════════════════════
+// Block diffusion generation (LLaDA2.X)
+// ═══════════════════════════════════════════════════════════════
+//
+// Generation flow (matching dFactory generate()):
+// 1. Pad prompt + gen_length to be divisible by block_length
+// 2. Fill generation positions with mask_id
+// 3. For each block (left to right):
+//    a. For each denoising step:
+//       - Forward pass on tokens[:current_window_end]
+//       - Get logits for the current block
+//       - Sample x0 and p(x0) for each masked position
+//       - Transfer tokens: commit high-confidence first (p > threshold)
+//         or top-k by confidence
+//       - Apply Levenshtein editing if enabled
+//       - Early stop if no masks remain
+//    b. Check for EOS
+
+static std::vector<int32_t> generate_block_diffusion(
+        diffuse_context * ctx,
+        const std::vector<int32_t> & prompt_tokens,
+        int n_generate,
+        const diffuse_sampler_params & params,
+        diffuse_step_callback callback) {
+
+    const auto & model = *ctx->model;
+    const auto & hp    = model.hparams;
+    const int mask_id  = hp.mask_token_id;
+    const int eos_id   = hp.eos_token_id;
+    const int n_vocab  = hp.n_vocab;
+    const int block_len = (int)hp.block_length;
+    const int del_id    = (int)model.delete_token_id;
+    const int ins_id    = (int)model.split_token_id;
+    const bool editing  = params.enable_editing && del_id > 0 && ins_id > 0;
+
+    int prompt_len = (int)prompt_tokens.size();
+
+    // Blocks tile from absolute position 0 (matches the reference generate(),
+    // and keeps every fed window a multiple of block_len, which the MoE block
+    // router requires).
+    int num_blocks   = (prompt_len + n_generate + block_len - 1) / block_len;
+    int total_length = num_blocks * block_len;
+
+    // Build token sequence: prompt + mask tokens for generation
+    std::vector<int32_t> seq(total_length, mask_id);
+    for (int i = 0; i < prompt_len && i < total_length; i++) {
+        seq[i] = prompt_tokens[i];
+    }
+
+    // Floor, not ceil: the block that straddles the end of the prompt still has
+    // mask positions to denoise. Rounding up skips it and leaves them masked
+    // forever, which poisons the context for every later block.
+    int prefill_blocks = prompt_len / block_len;
+
+    // Denoising schedule
+    int steps = std::min(params.n_steps, block_len);
+    auto transfer_schedule = get_num_transfer_tokens(block_len, steps);
+
+    std::mt19937 rng(params.seed);
+
+    DIFFUSE_LOG("block diffusion: %d blocks (prefill=%d), prompt=%d, block_len=%d, steps=%d, threshold=%.2f, editing=%s",
+                num_blocks, prefill_blocks, prompt_len, block_len, steps, params.threshold,
+                editing ? "yes" : "no");
+
+    using clk = std::chrono::steady_clock;
+    auto gen_start = clk::now();
+    double total_forward_ms = 0.0;
+
+    // Process blocks left to right
+    for (int blk = prefill_blocks; blk < num_blocks; blk++) {
+        int block_start = blk * block_len;
+        int cur_window_end = std::min(block_start + block_len, total_length);
+
+        // Token buffer for this window (grows as we process more blocks)
+        // We only feed tokens up to the current block's end
+        std::vector<float> logits(cur_window_end * n_vocab);
+
+        for (int step = 0; step < steps; step++) {
+            // Check if there are still masked tokens in the current block
+            int block_offset = block_start;
+            int block_n = std::min(block_len, total_length - block_start);
+            bool any_masked = false;
+            for (int i = 0; i < block_n; i++) {
+                if (seq[block_offset + i] == mask_id) { any_masked = true; break; }
+            }
+            if (!any_masked) break;
+
+            // Forward pass
+            auto t0 = clk::now();
+            if (!diffuse_forward_moe(ctx, seq.data(), cur_window_end, logits.data())) {
+                DIFFUSE_DIE("forward pass failed at block %d, step %d", blk, step);
+            }
+            auto t1 = clk::now();
+            total_forward_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+            // Sample tokens for masked positions in the current block
+            struct Candidate {
+                int pos;       // absolute position in seq
+                int token;     // sampled token
+                float prob;    // probability of sampled token
+            };
+            std::vector<Candidate> candidates;
+
+            for (int i = 0; i < block_n; i++) {
+                int abs_pos = block_offset + i;
+                if (seq[abs_pos] != mask_id) continue;
+
+                const float * logit_row = logits.data() + (size_t)abs_pos * n_vocab;
+                int sampled_token;
+                float sampled_prob;
+                sample_token(logit_row, n_vocab, params.temperature, params.seed, rng,
+                             sampled_token, sampled_prob);
+
+                // For low_confidence: use the sampled probability as confidence
+                // For random: assign random confidence
+                float confidence;
+                if (params.remasking == diffuse_remasking::RANDOM) {
+                    confidence = std::uniform_real_distribution<float>(0.0f, 1.0f)(rng);
+                } else {
+                    confidence = sampled_prob;
+                }
+
+                candidates.push_back({abs_pos, sampled_token, confidence});
+            }
+
+            if (candidates.empty()) break;
+
+            // Determine how many tokens to transfer this step
+            int num_to_transfer = transfer_schedule[step];
+
+            // Sort candidates by confidence (highest first)
+            std::sort(candidates.begin(), candidates.end(),
+                      [](const Candidate & a, const Candidate & b) {
+                          return a.prob > b.prob;
+                      });
+
+            // Transfer: commit tokens above threshold, or top-k
+            int transferred = 0;
+            for (const auto & c : candidates) {
+                if (transferred >= num_to_transfer && c.prob < params.threshold) {
+                    break;
+                }
+                if (transferred >= num_to_transfer) {
+                    // Already transferred enough, but check if more exceed threshold
+                    if (c.prob < params.threshold) break;
+                }
+                seq[c.pos] = c.token;
+                transferred++;
+            }
+
+            // Ensure at least 1 token transferred if there are masked positions
+            if (transferred == 0 && !candidates.empty()) {
+                seq[candidates[0].pos] = candidates[0].token;
+                transferred = 1;
+            }
+
+            // Levenshtein editing: apply DELETE and INSERT
+            if (editing) {
+                for (int i = 0; i < block_n; i++) {
+                    int abs_pos = block_offset + i;
+                    if (seq[abs_pos] == del_id) {
+                        // DELETE: mark for deletion (shift left later)
+                        // For simplicity, replace with mask and handle in post-processing
+                        seq[abs_pos] = mask_id;
+                    } else if (seq[abs_pos] == ins_id) {
+                        // INSERT: create a new mask position
+                        // Replace INSERT with mask (creates an editable slot)
+                        seq[abs_pos] = mask_id;
+                    }
+                }
+            }
+
+            if (callback) {
+                callback(blk, num_blocks, step + 1, steps, seq);
+            }
+        }
+
+        // Check for EOS in completed block. LLaDA2 ends an assistant turn with
+        // <|role_end|>, which is a separate id from <|endoftext|>, so both stop.
+        // Scan only the generated span: the prompt itself contains <|role_end|>
+        // separators, and matching those would return a negative-length range.
+        if (params.eos_early_stop && (eos_id > 0 || params.stop_token_2 >= 0)) {
+            for (int i = std::max(block_start, prompt_len); i < cur_window_end; i++) {
+                if (seq[i] == eos_id || (params.stop_token_2 >= 0 && seq[i] == params.stop_token_2)) {
+                    // Check all positions before EOS are unmasked
+                    bool all_clear = true;
+                    for (int j = prompt_len; j < i; j++) {
+                        if (seq[j] == mask_id) { all_clear = false; break; }
+                    }
+                    if (all_clear) {
+                        // Return up to and including EOS
+                        auto gen_end = clk::now();
+                        double total_ms = std::chrono::duration<double, std::milli>(gen_end - gen_start).count();
+                        DIFFUSE_LOG("generation complete (EOS): %d tokens in %.0fms (%.1f tok/s, fwd=%.0fms)",
+                                    i - prompt_len + 1, total_ms,
+                                    1000.0 * (i - prompt_len + 1) / total_ms, total_forward_ms);
+                        return std::vector<int32_t>(seq.begin() + prompt_len, seq.begin() + i + 1);
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Finalize ───────────────────────────────────────────────
+    auto gen_end = clk::now();
+    double total_ms = std::chrono::duration<double, std::milli>(gen_end - gen_start).count();
+    int actual_gen = std::min(n_generate, total_length - prompt_len);
+
+    DIFFUSE_LOG("generation complete: %d tokens in %.0fms (%.1f tok/s, fwd=%.0fms)",
+                actual_gen, total_ms, 1000.0 * actual_gen / total_ms, total_forward_ms);
+
+    // Extract generated tokens, filtering out mask tokens
+    std::vector<int32_t> result;
+    result.reserve(n_generate);
+    for (int i = prompt_len; i < prompt_len + n_generate && i < total_length; i++) {
+        if (seq[i] != mask_id) {
+            result.push_back(seq[i]);
+        }
+    }
+    return result;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Flat diffusion generation (LLaDA 1.0 / Dream)
+// ═══════════════════════════════════════════════════════════════
+//
+// Generates all tokens simultaneously with full bidirectional attention.
+// Iterative unmasking across the full sequence.
+
+static std::vector<int32_t> generate_flat_diffusion(
         diffuse_context * ctx,
         const std::vector<int32_t> & prompt_tokens,
         int n_generate,
@@ -65,320 +317,118 @@ std::vector<int32_t> diffuse_sample(
         diffuse_step_callback callback) {
 
     const auto & hp = ctx->model->hparams;
-    const int mask_id = hp.mask_token_id;
-    const int n_vocab = hp.n_vocab;
+    const int mask_id  = hp.mask_token_id;
+    const int n_vocab  = hp.n_vocab;
 
-    // Dream (Qwen2.5 backbone) uses shifted logits: output at position i
-    // predicts token at position i+1 (autoregressive convention).
-    // To get logits for position i, read from position max(i-1, 0).
-    const bool shift_logits = (ctx->model->model_type == "dream");
-
-    // Build initial sequence: prompt + MASK tokens
-    std::vector<int32_t> seq = prompt_tokens;
     int prompt_len = (int)prompt_tokens.size();
-    seq.resize(prompt_len + n_generate, mask_id);
-    int total_len = (int)seq.size();
+    int total_len = prompt_len + n_generate;
 
-    // Track which positions are still masked
+    // Build sequence: prompt + mask tokens
+    std::vector<int32_t> seq = prompt_tokens;
+    seq.resize(total_len, mask_id);
+
     std::vector<bool> is_masked(total_len, false);
-    for (int i = prompt_len; i < total_len; i++) {
-        is_masked[i] = true;
-    }
+    for (int i = prompt_len; i < total_len; i++) is_masked[i] = true;
     int n_masked = n_generate;
 
-    // Full logits buffer (only used for step 0)
-    std::vector<float> logits_full(total_len * n_vocab);
-
-    // RNG for stochastic sampling
+    std::vector<float> logits(total_len * n_vocab);
     std::mt19937 rng(params.seed);
 
-    // ── Inter-step KV cache ──────────────────────────────────────
-    const bool use_cache = params.use_cache;
-    diffuse_step_cache cache;
-    if (use_cache) {
-        cache.init(total_len, prompt_len,
-                   (int)hp.n_layer, (int)hp.n_embd_head(), (int)hp.n_head);
-    }
-
-    const int cache_refresh = params.cache_refresh;
-    const int cache_keep_active = params.cache_keep_active;
-
-    const char * remasking_name =
-        params.remasking == diffuse_remasking::ENTROPY_EXIT  ? "entropy_exit" :
-        params.remasking == diffuse_remasking::LOW_CONFIDENCE ? "low_confidence" :
-        params.remasking == diffuse_remasking::MASKGIT_PLUS  ? "maskgit_plus" :
-        params.remasking == diffuse_remasking::TOPK_MARGIN   ? "topk_margin" :
-        "random";
-    DIFFUSE_LOG("diffusion: %d steps, %d tokens to generate, scheduler=%s, cache=%s, refresh=%d, keep_active=%d",
-                params.n_steps, n_generate,
-                remasking_name,
-                use_cache ? "ON" : "OFF",
-                cache_refresh, cache_keep_active);
-
-    // ── Timing accumulators ──────────────────────────────────────
     using clk = std::chrono::steady_clock;
-    double total_forward_ms  = 0.0;
-    double total_sample_ms   = 0.0;
-    double total_sort_ms     = 0.0;
-    double total_unmask_ms   = 0.0;
-    int    actual_steps      = 0;
-    auto   gen_start         = clk::now();
+    auto gen_start = clk::now();
 
     for (int step = 0; step < params.n_steps && n_masked > 0; step++) {
-        actual_steps++;
-
-        // ── Forward pass (timed) ─────────────────────────────────
+        // Forward pass
         auto t0 = clk::now();
-
-        // Logits pointer: where to read logits from after forward pass
-        // For full forward: logits are in logits_full[pos * n_vocab]
-        // For cached forward: logits are in logits_active[active_idx * n_vocab]
-        float * logit_source = nullptr;
-
-        // Active set tracking for cached forward
-        std::vector<int> cached_positions, active_positions, active_to_orig;
-        int n_active = 0;
-        bool used_cache = false;
-
-        // Force full forward on step 0, when cache disabled, or at refresh intervals
-        bool force_full = !use_cache || !cache.initialized ||
-                          (cache_refresh > 0 && step > 0 && (step % cache_refresh == 0)) ||
-                          (ctx->model->model_type == "llada2_moe");  // MoE: no cached forward yet
-
-        if (force_full) {
-            // ── Full forward (step 0, refresh, or cache disabled) ─
-            if (ctx->model->model_type == "llada2_moe") {
-                if (!diffuse_forward_moe_full(ctx, seq.data(), total_len,
-                                              logits_full.data(),
-                                              use_cache ? &cache : nullptr)) {
-                    DIFFUSE_DIE("forward pass failed at step %d", step);
-                }
-            } else {
-                if (!diffuse_forward_full(ctx, seq.data(), total_len,
-                                          logits_full.data(),
-                                          use_cache ? &cache : nullptr)) {
-                    DIFFUSE_DIE("forward pass failed at step %d", step);
-                }
-            }
-            if (use_cache) cache.update_seq(seq.data(), total_len);
-            logit_source = logits_full.data();
-            n_active = total_len;  // all positions
-        } else {
-            // ── Steps 1+: cached forward, only active positions ──
-            cache.compute_active_set(seq.data(), is_masked, total_len,
-                                     step, cache_keep_active,
-                                     cached_positions, active_positions,
-                                     active_to_orig);
-            n_active = (int)active_positions.size();
-
-            if (n_active >= total_len || n_active == 0) {
-                // Edge case: all active or none → full forward
-                if (!diffuse_forward_full(ctx, seq.data(), total_len,
-                                          logits_full.data(), &cache)) {
-                    DIFFUSE_DIE("forward pass failed at step %d", step);
-                }
-                cache.update_seq(seq.data(), total_len);
-                logit_source = logits_full.data();
-                n_active = total_len;
-            } else {
-                // Build active token arrays
-                std::vector<int32_t> active_tokens(n_active);
-                std::vector<int32_t> active_pos_idx(n_active);
-                for (int a = 0; a < n_active; a++) {
-                    int orig = active_positions[a];
-                    active_tokens[a] = seq[orig];
-                    active_pos_idx[a] = orig;
-                }
-
-                // Allocate logits for active positions only
-                std::vector<float> logits_active(n_active * n_vocab);
-
-                if (!diffuse_forward_cached(
-                        ctx, active_tokens.data(), active_pos_idx.data(),
-                        n_active, total_len, &cache,
-                        cached_positions, active_positions,
-                        logits_active.data())) {
-                    DIFFUSE_DIE("cached forward failed at step %d", step);
-                }
-                cache.update_seq(seq.data(), total_len);
-                used_cache = true;
-
-                // Scatter active logits into full logits buffer
-                // We only need logits for masked positions, which are
-                // always in the active set. Build a map: orig_pos → active_idx
-                // for efficient lookup.
-                // Actually, we can iterate only over masked positions
-                // and find their index in active_positions.
-
-                // For simplicity: store in logits_full at original positions
-                for (int a = 0; a < n_active; a++) {
-                    int orig = active_positions[a];
-                    memcpy(logits_full.data() + (size_t)orig * n_vocab,
-                           logits_active.data() + (size_t)a * n_vocab,
-                           n_vocab * sizeof(float));
-                }
-                logit_source = logits_full.data();
-            }
+        if (!diffuse_forward_dense(ctx, seq.data(), total_len, logits.data())) {
+            DIFFUSE_DIE("forward pass failed at step %d", step);
         }
-
         auto t1 = clk::now();
         double fwd_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-        total_forward_ms += fwd_ms;
 
-        // ── Sampling: extract candidates (timed) ─────────────────
-        auto t2 = clk::now();
-
-        struct candidate {
-            int pos;
-            int token;
-            float confidence;
-            float entropy;
-        };
-        std::vector<candidate> candidates;
-        candidates.reserve(n_masked);
+        // Sample candidates for masked positions
+        struct Candidate { int pos; int token; float confidence; };
+        std::vector<Candidate> candidates;
 
         for (int i = 0; i < total_len; i++) {
             if (!is_masked[i]) continue;
 
-            // Dream: shifted logits (position i uses logits from position max(i-1, 0))
-            int logit_pos = shift_logits ? std::max(i - 1, 0) : i;
-            const float * logit_row = logit_source + (size_t)logit_pos * n_vocab;
-            float ent = compute_entropy(logit_row, n_vocab);
+            const float * logit_row = logits.data() + (size_t)i * n_vocab;
+            int sampled_token;
+            float sampled_prob;
+            sample_token(logit_row, n_vocab, params.temperature, params.seed, rng,
+                         sampled_token, sampled_prob);
 
-            if (params.temperature <= 0.0f) {
-                // Find top-1 (and top-2 for TOPK_MARGIN)
-                int best = 0;
-                float best_val = logit_row[0];
-                float second_val = -1e30f;
-                for (int v = 1; v < n_vocab; v++) {
-                    if (logit_row[v] > best_val) {
-                        second_val = best_val;
-                        best_val = logit_row[v];
-                        best = v;
-                    } else if (logit_row[v] > second_val) {
-                        second_val = logit_row[v];
-                    }
-                }
-                float conf = (params.remasking == diffuse_remasking::TOPK_MARGIN)
-                           ? (best_val - second_val) : best_val;
-                candidates.push_back({i, best, conf, ent});
-            } else {
-                float max_logit = *std::max_element(logit_row, logit_row + n_vocab);
-                std::vector<float> probs(n_vocab);
-                float sum = 0.0f;
-                for (int v = 0; v < n_vocab; v++) {
-                    probs[v] = expf((logit_row[v] - max_logit) / params.temperature);
-                    sum += probs[v];
-                }
-                for (int v = 0; v < n_vocab; v++) probs[v] /= sum;
+            float confidence = (params.remasking == diffuse_remasking::RANDOM)
+                ? std::uniform_real_distribution<float>(0.0f, 1.0f)(rng)
+                : sampled_prob;
 
-                std::discrete_distribution<int> dist(probs.begin(), probs.end());
-                int sampled = dist(rng);
-                candidates.push_back({i, sampled, probs[sampled], ent});
-            }
+            candidates.push_back({i, sampled_token, confidence});
         }
-        auto t3 = clk::now();
-        total_sample_ms += std::chrono::duration<double, std::milli>(t3 - t2).count();
 
-        // ── Scheduling + sorting (timed) ─────────────────────────
-        auto t4 = clk::now();
-
-        int n_unmask = tokens_to_unmask(step, params.n_steps, n_masked, params.schedule);
-
-        if (params.remasking == diffuse_remasking::ENTROPY_EXIT) {
-            std::sort(candidates.begin(), candidates.end(),
-                      [](const candidate & a, const candidate & b) {
-                          return a.entropy < b.entropy;
-                      });
-
-            int n_easy = 0;
-            for (const auto & c : candidates) {
-                if (c.entropy < params.entropy_threshold) n_easy++;
-                else break;
-            }
-
-            n_unmask = std::max(n_unmask, n_easy);
-            n_unmask = std::min(n_unmask, (int)candidates.size());
-        } else if (params.remasking == diffuse_remasking::LOW_CONFIDENCE ||
-                   params.remasking == diffuse_remasking::MASKGIT_PLUS) {
-            // Both sort by highest confidence (top-1 logit value)
-            std::sort(candidates.begin(), candidates.end(),
-                      [](const candidate & a, const candidate & b) {
-                          return a.confidence > b.confidence;
-                      });
-        } else if (params.remasking == diffuse_remasking::TOPK_MARGIN) {
-            // Sort by margin between top-1 and top-2 logits (highest margin first)
-            std::sort(candidates.begin(), candidates.end(),
-                      [](const candidate & a, const candidate & b) {
-                          return a.confidence > b.confidence;  // margin stored in confidence field
-                      });
+        // Determine how many to unmask this step
+        float t0f = (float)step / params.n_steps;
+        float t1f = (float)(step + 1) / params.n_steps;
+        float frac;
+        if (params.schedule == diffuse_schedule::COSINE) {
+            float cos0 = cosf(t0f * M_PI * 0.5f);
+            float cos1 = cosf(t1f * M_PI * 0.5f);
+            frac = (cos0 - cos1) / cos0;
         } else {
-            std::shuffle(candidates.begin(), candidates.end(), rng);
+            frac = 1.0f / (params.n_steps - step);
         }
+        int n_unmask = std::max(1, (int)roundf(frac * n_masked));
+        n_unmask = std::min(n_unmask, (int)candidates.size());
 
-        auto t5 = clk::now();
-        total_sort_ms += std::chrono::duration<double, std::milli>(t5 - t4).count();
+        // Sort by confidence
+        std::sort(candidates.begin(), candidates.end(),
+                  [](const Candidate & a, const Candidate & b) {
+                      return a.confidence > b.confidence;
+                  });
 
-        // ── Unmasking (timed) ────────────────────────────────────
-        auto t6 = clk::now();
-
-        int actually_unmasked = 0;
-        for (int j = 0; j < n_unmask && j < (int)candidates.size(); j++) {
-            int pos = candidates[j].pos;
-            seq[pos] = candidates[j].token;
-            is_masked[pos] = false;
+        // Unmask top candidates
+        for (int j = 0; j < n_unmask; j++) {
+            seq[candidates[j].pos] = candidates[j].token;
+            is_masked[candidates[j].pos] = false;
             n_masked--;
-            actually_unmasked++;
         }
 
-        auto t7 = clk::now();
-        total_unmask_ms += std::chrono::duration<double, std::milli>(t7 - t6).count();
-
-        DIFFUSE_LOG("  step %d/%d: unmasked %d tokens, %d remaining "
-                    "(fwd=%.1fms, active=%d/%d%s)",
-                    step + 1, params.n_steps, actually_unmasked, n_masked,
-                    fwd_ms,
-                    used_cache ? (int)active_positions.size() : total_len,
-                    total_len,
-                    used_cache ? " CACHED" :
-                    (force_full && step > 0) ? " REFRESH" : "");
+        DIFFUSE_LOG("  step %d/%d: unmasked %d, %d remaining (fwd=%.1fms)",
+                    step + 1, params.n_steps, n_unmask, n_masked, fwd_ms);
 
         if (callback) {
-            callback(step + 1, params.n_steps, seq);
+            callback(0, 1, step + 1, params.n_steps, seq);
         }
     }
 
-    // ── Timing summary ───────────────────────────────────────────
     auto gen_end = clk::now();
-    double gen_total_ms = std::chrono::duration<double, std::milli>(gen_end - gen_start).count();
-    double overhead_ms  = gen_total_ms - total_forward_ms - total_sample_ms
-                        - total_sort_ms - total_unmask_ms;
+    double total_ms = std::chrono::duration<double, std::milli>(gen_end - gen_start).count();
+    DIFFUSE_LOG("generation complete: %d tokens in %.0fms (%.1f tok/s)",
+                n_generate, total_ms, 1000.0 * n_generate / total_ms);
 
-    DIFFUSE_LOG("=== TIMING BREAKDOWN (%d steps, cache=%s) ===",
-                actual_steps, use_cache ? "ON" : "OFF");
-    DIFFUSE_LOG("  forward:   %8.1f ms  (%5.1f%%)  avg=%.1f ms/step",
-                total_forward_ms, 100.0 * total_forward_ms / gen_total_ms,
-                total_forward_ms / std::max(actual_steps, 1));
-    DIFFUSE_LOG("  sampling:  %8.1f ms  (%5.1f%%)  avg=%.1f ms/step",
-                total_sample_ms, 100.0 * total_sample_ms / gen_total_ms,
-                total_sample_ms / std::max(actual_steps, 1));
-    DIFFUSE_LOG("  sorting:   %8.1f ms  (%5.1f%%)",
-                total_sort_ms, 100.0 * total_sort_ms / gen_total_ms);
-    DIFFUSE_LOG("  unmask:    %8.1f ms  (%5.1f%%)",
-                total_unmask_ms, 100.0 * total_unmask_ms / gen_total_ms);
-    DIFFUSE_LOG("  overhead:  %8.1f ms  (%5.1f%%)",
-                overhead_ms, 100.0 * overhead_ms / gen_total_ms);
-    DIFFUSE_LOG("  TOTAL:     %8.1f ms  (%.2f tok/s)",
-                gen_total_ms, 1000.0 * n_generate / gen_total_ms);
-
-    // ── Cleanup ──────────────────────────────────────────────────
-    cache.clear();
-
-    // Return only the generated tokens
     return std::vector<int32_t>(seq.begin() + prompt_len, seq.end());
 }
 
-// ── Public API wrapper ─────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════
+// Public API
+// ═══════════════════════════════════════════════════════════════
+
+std::vector<int32_t> diffuse_sample(
+        diffuse_context * ctx,
+        const std::vector<int32_t> & prompt_tokens,
+        int n_generate,
+        const diffuse_sampler_params & params,
+        diffuse_step_callback callback) {
+
+    const auto & model = *ctx->model;
+
+    if (model.arch == diffuse_arch::LLaDA2_MoE && model.hparams.block_length > 0) {
+        return generate_block_diffusion(ctx, prompt_tokens, n_generate, params, callback);
+    } else {
+        return generate_flat_diffusion(ctx, prompt_tokens, n_generate, params, callback);
+    }
+}
+
 std::vector<int32_t> diffuse_generate(
         diffuse_context * ctx,
         const std::vector<int32_t> & prompt_tokens,

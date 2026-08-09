@@ -1,5 +1,8 @@
 # Benchmark Results — diffuse-cpp v0.2.0
 
+> **Note**: These benchmarks were run against the old LLaDA-8B model and flat-diffusion architecture (pre-LLaDA2.2 rewrite). The `entropy_exit` scheduler and inter-step cache are no longer supported. These results are preserved for historical reference only.
+
+
 **System**: AMD EPYC 4465P 12-Core (24 threads), 125GB RAM, Ubuntu 24.04, GCC 13.3
 **Model**: LLaDA-8B-Instruct, 64/256 tokens generated, 32-token prompt
 **Protocol**: 3 reps + 1 warmup per config, exclusive CPU (no competing processes)
