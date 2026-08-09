@@ -43,7 +43,6 @@ void init_quant(int dst_type_int) {
     ggml_quantize_init((ggml_type)dst_type_int);
 }
 
-// Free quantization tables
+// Cleanup (no-op in this GGML version)
 void cleanup_quant(void) {
-    ggml_quantize_free();
 }
