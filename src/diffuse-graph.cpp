@@ -42,8 +42,6 @@ static struct ggml_cgraph * diffuse_build_graph_dense(
 
     struct ggml_tensor * cur = ggml_get_rows(ctx, model.tok_embd, inp_tokens);
 
-    const int n_kv_div = n_head / n_head_kv;
-
     for (int il = 0; il < n_layer; il++) {
         const auto & layer = model.layers[il];
         struct ggml_tensor * residual = cur;
@@ -67,20 +65,19 @@ static struct ggml_cgraph * diffuse_build_graph_dense(
         K = ggml_reshape_3d(ctx, K, n_embd_head, n_head_kv, N);
         V = ggml_reshape_3d(ctx, V, n_embd_head, n_head_kv, N);
 
-        // RoPE
-        cur = ggml_rope_ext(ctx, Q, inp_pos, nullptr, n_embd_head, 0, 0, hp.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
-        struct ggml_tensor * Kr = ggml_rope_ext(ctx, K, inp_pos, nullptr, n_embd_head, 0, 0, hp.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        // RoPE (operates on [head_dim, n_head, n_tokens])
+        Q = ggml_rope_ext(ctx, Q, inp_pos, nullptr, n_embd_head, 0, 0, hp.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        K = ggml_rope_ext(ctx, K, inp_pos, nullptr, n_embd_head, 0, 0, hp.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
 
-        // GQA: repeat KV heads
-        if (n_kv_div > 1) {
-            Kr = ggml_cont(ctx, Kr);
-            V  = ggml_cont(ctx, V);
-            Kr = ggml_repeat(ctx, Kr, ggml_new_tensor_3d(ctx, Kr->type, Kr->ne[0], n_head, N));
-            V  = ggml_repeat(ctx, V,  ggml_new_tensor_3d(ctx, V->type,  V->ne[0], n_head, N));
-        }
+        // Permute to flash-attn layout [head_dim, n_tokens, n_head].
+        // flash_attn_ext broadcasts KV heads for GQA (query head h → kv head h/(n_head/n_head_kv)),
+        // so no manual repeat is needed (and manual ggml_repeat would tile heads in the wrong order).
+        Q = ggml_permute(ctx, Q, 0, 2, 1, 3);
+        K = ggml_permute(ctx, K, 0, 2, 1, 3);
+        V = ggml_permute(ctx, V, 0, 2, 1, 3);
 
         // Full bidirectional attention (flat diffusion — no causal mask)
-        cur = ggml_flash_attn_ext(ctx, cur, Kr, V, nullptr, 1.0f / sqrtf((float)n_embd_head), 0.0f, 0.0f);
+        cur = ggml_flash_attn_ext(ctx, Q, K, V, nullptr, 1.0f / sqrtf((float)n_embd_head), 0.0f, 0.0f);
         cur = ggml_reshape_2d(ctx, cur, n_embd, N);
 
         {

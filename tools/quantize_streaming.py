@@ -91,7 +91,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--input", required=True)
     ap.add_argument("--output", required=True)
-    ap.add_argument("--type", default="q4_k_m", choices=["q4_k_m","q8_0","q4_0","q6_k"])
+    ap.add_argument("--type", default="q4_k_m", choices=["q4_k_m","q4_k_s","q8_0","q4_0","q6_k"])
     ap.add_argument("--lib", default="/workspace/quant_lib.so")
     args = ap.parse_args()
     t0 = time.time()
@@ -111,6 +111,11 @@ def main():
 
     if args.type == "q4_k_m":
         sch = {'norm': F32, 'embed': F16, 'output': Q6_K, 'attn': Q4_K, 'ffn': Q4_K, 'ffn_edge': Q6_K, 'moe_gate': F32}
+    elif args.type == "q4_k_s":
+        # "S" = uniform Q4_K; unlike _m the first/last FFN layers are not upgraded to Q6_K.
+        # output.weight stays Q6_K and the router (moe_gate) stays F32 — routing is far too
+        # sensitive to quantize, a wrong expert choice costs more than the bytes saved.
+        sch = {'norm': F32, 'embed': F16, 'output': Q6_K, 'attn': Q4_K, 'ffn': Q4_K, 'ffn_edge': Q4_K, 'moe_gate': F32}
     elif args.type == "q8_0":
         sch = {'norm': F32, 'embed': F16, 'output': Q8_0, 'attn': Q8_0, 'ffn': Q8_0, 'ffn_edge': Q8_0, 'moe_gate': F32}
     elif args.type == "q4_0":

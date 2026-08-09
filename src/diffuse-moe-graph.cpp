@@ -20,32 +20,30 @@ static struct ggml_tensor * build_block_causal_mask(
         int n_tokens,
         int block_length) {
 
-    // Mask shape for flash_attn_ext: [n_kv, n_batch, ne32, ne33]
-    // = [n_tokens_kv, n_tokens_q, 1, 1]
-    struct ggml_tensor * mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_tokens, n_tokens);
+    // Mask shape for flash_attn_ext: [n_kv, n_batch, ne32, ne33] = [kv_len, q_len, 1, 1].
+    // flash_attn_ext reads the mask as F16 (ggml-cpu/ops.cpp), so it MUST be F16 — an F32
+    // mask decodes to NaN halves for the -INFINITY entries and breaks attention.
+    struct ggml_tensor * mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_tokens, n_tokens);
     ggml_set_name(mask, "block_causal_mask");
     ggml_set_input(mask);
 
-    float * mask_data = (float *)mask->data;
+    ggml_fp16_t * mask_data = (ggml_fp16_t *)mask->data;
+    const ggml_fp16_t zero    = ggml_fp32_to_fp16(0.0f);
+    const ggml_fp16_t neg_inf = ggml_fp32_to_fp16(-INFINITY);
 
     if (block_length <= 0) {
         // Full bidirectional: all zeros
         for (int i = 0; i < n_tokens * n_tokens; i++) {
-            mask_data[i] = 0.0f;
+            mask_data[i] = zero;
         }
     } else {
-        // Block-causal: position i can attend to j iff block_id(i) >= block_id(j)
+        // Block-causal: query i can attend to key j iff block_id(i) >= block_id(j).
+        // Row-major data[q*ne0 + kv], ne0 = kv_len, so data[i*n_tokens + j] = mask[query i][key j].
         for (int i = 0; i < n_tokens; i++) {
             int block_i = i / block_length;
             for (int j = 0; j < n_tokens; j++) {
                 int block_j = j / block_length;
-                // mask_data layout: [n_kv, n_batch] → [j, i] since ne[0]=n_tokens_kv=n_tokens
-                // Wait: ggml 2D tensor ne[0] = n_tokens (columns/fast), ne[1] = n_tokens (rows)
-                // Data is row-major: data[i * ne[0] + j] = mask[i][j]
-                // For flash_attn_ext: mask is [n_kv, n_batch, ...] = [kv_len, q_len, ...]
-                // So ne[0] = kv_len = n_tokens, ne[1] = q_len = n_tokens
-                // data[q_idx * n_tokens + kv_idx]
-                mask_data[i * n_tokens + j] = (block_i >= block_j) ? 0.0f : -INFINITY;
+                mask_data[i * n_tokens + j] = (block_i >= block_j) ? zero : neg_inf;
             }
         }
     }
@@ -84,7 +82,6 @@ static struct ggml_cgraph * diffuse_build_graph_moe(
     const int n_layer     = (int)hp.n_layer;
     const int N           = n_tokens;
     const int block_len   = (int)hp.block_length;
-    const int n_kv_div    = n_head / n_head_kv;
     const float rms_eps   = hp.rms_norm_eps;
     const float rope_base = hp.rope_theta;
 
@@ -151,17 +148,12 @@ static struct ggml_cgraph * diffuse_build_graph_moe(
         Q = ggml_rope_ext(ctx, Q, inp_pos, nullptr, rotary_dim, 0, 0, rope_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
         K = ggml_rope_ext(ctx, K, inp_pos, nullptr, rotary_dim, 0, 0, rope_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
 
-        // GQA: repeat KV heads
-        if (n_kv_div > 1) {
-            // K/V are [head_dim, n_kv_head, N] after RoPE — need to expand to n_head
-            // ggml_repeat requires contiguous input, so cont first
-            K = ggml_cont(ctx, K);
-            V = ggml_cont(ctx, V);
-            struct ggml_tensor * k_expanded = ggml_new_tensor_3d(ctx, K->type, K->ne[0], n_head, N);
-            K = ggml_repeat(ctx, K, k_expanded);
-            struct ggml_tensor * v_expanded = ggml_new_tensor_3d(ctx, V->type, V->ne[0], n_head, N);
-            V = ggml_repeat(ctx, V, v_expanded);
-        }
+        // Permute to flash-attn layout [head_dim, n_tokens, n_head].
+        // flash_attn_ext broadcasts KV heads for GQA (query head h → kv head h/(n_head/n_head_kv)),
+        // so no manual repeat is needed — and a manual ggml_repeat tiles the heads in the wrong order.
+        Q = ggml_permute(ctx, Q, 0, 2, 1, 3);
+        K = ggml_permute(ctx, K, 0, 2, 1, 3);
+        V = ggml_permute(ctx, V, 0, 2, 1, 3);
 
         // Flash attention with block-causal mask
         struct ggml_tensor * attn = ggml_flash_attn_ext(
@@ -188,75 +180,85 @@ static struct ggml_cgraph * diffuse_build_graph_moe(
             cur = ggml_mul(ctx, g, u);
             cur = ggml_mul_mat(ctx, ensure_f32_moe(ctx, ml.ffn_down), cur);
         } else {
-            // MoE layer
-            // Router: sigmoid scoring → top-k selection
+            // ── MoE layer (LLaDA2 / Ling — DeepSeek-V3 style group-limited routing) ──
+            // Mirrors llama.cpp build_moe_ffn: sigmoid gating, bias-corrected group
+            // selection (choice only), unbiased weights, normalize + scale, weighted
+            // sum of the top-k experts, plus a shared expert on the same input.
             const int n_experts = (int)model.n_experts;
-            const int top_k = (int)model.n_experts_per_tok;
+            const int top_k     = (int)model.n_experts_per_tok;
+            const int n_group   = (int)model.n_group;
+            const int topk_grp  = (int)model.topk_group;
 
-            // Router logits: [n_experts, N]
-            struct ggml_tensor * router_logits = ggml_mul_mat(ctx, ensure_f32_moe(ctx, ml.gate_weight), cur);
+            struct ggml_tensor * moe_in = cur;  // [n_embd, N] — input to routed AND shared experts
 
-            // Sigmoid scores + expert_bias
-            struct ggml_tensor * scores = ggml_sigmoid(ctx, router_logits);
+            // Router logits → sigmoid gating probs (unbiased)
+            struct ggml_tensor * logits = ggml_mul_mat(ctx, ensure_f32_moe(ctx, ml.gate_weight), moe_in);
+            struct ggml_tensor * probs  = ggml_sigmoid(ctx, logits);  // [n_experts, N]
+
+            // Selection scores: add expert bias (affects choice only, not the applied weights)
+            struct ggml_tensor * sel = probs;
             if (ml.gate_bias) {
-                scores = ggml_add(ctx, scores, ensure_f32_moe(ctx, ml.gate_bias));
+                sel = ggml_add(ctx, probs, ensure_f32_moe(ctx, ml.gate_bias));
             }
 
-            // Top-k expert selection per token
-            // ggml_top_k(ctx, a, k): a=[n_experts, N] → result=[k, N] I32 indices
-            struct ggml_tensor * topk_indices = ggml_top_k(ctx, scores, top_k);
+            // Group-limited routing: keep only experts in the top `topk_grp` groups,
+            // where a group's score is the sum of its top-2 experts' selection scores.
+            const bool use_groups = (n_group > 1) && (topk_grp > 0) && (topk_grp < n_group)
+                                    && (n_experts % n_group == 0) && (n_experts / n_group >= 2);
+            if (use_groups) {
+                const int eg = n_experts / n_group;                                        // experts per group
+                struct ggml_tensor * selg = ggml_reshape_3d(ctx, sel, eg, n_group, N);      // [eg, n_group, N]
+                struct ggml_tensor * g2   = ggml_top_k(ctx, selg, 2);                       // [2, n_group, N] idx
+                struct ggml_tensor * g2v  = ggml_get_rows(ctx,
+                        ggml_reshape_4d(ctx, selg, 1, eg, n_group, N), g2);                 // [1, 2, n_group, N] vals
+                struct ggml_tensor * gscore = ggml_sum_rows(ctx,
+                        ggml_reshape_3d(ctx, g2v, 2, n_group, N));                          // [1, n_group, N]
+                gscore = ggml_reshape_2d(ctx, gscore, n_group, N);                          // [n_group, N]
+                struct ggml_tensor * gsel   = ggml_top_k(ctx, gscore, topk_grp);           // [topk_grp, N] group idx
+                struct ggml_tensor * selg_k = ggml_get_rows(ctx, selg, gsel);              // [eg, topk_grp, N]
+                sel = ggml_set_rows(ctx,
+                        ggml_fill(ctx, selg, -INFINITY), selg_k, gsel);                    // mask non-selected groups
+                sel = ggml_reshape_2d(ctx, sel, n_experts, N);                             // [n_experts, N]
+            }
 
-            // Flatten indices to 1D for mul_mat_id: [k, N] → [k*N]
-            topk_indices = ggml_reshape_2d(ctx, topk_indices, top_k * N, 1);
+            // Final expert selection + gating weights (weights gathered from UNBIASED probs)
+            struct ggml_tensor * idx = ggml_top_k(ctx, sel, top_k);                        // [top_k, N] i32
+            struct ggml_tensor * weights = ggml_get_rows(ctx,
+                    ggml_reshape_3d(ctx, probs, 1, n_experts, N), idx);                    // [1, top_k, N]
+            if (model.norm_topk_prob) {
+                struct ggml_tensor * w2 = ggml_reshape_2d(ctx, weights, top_k, N);
+                w2 = ggml_div(ctx, w2, ggml_sum_rows(ctx, w2));                            // renormalize over top_k
+                weights = ggml_reshape_3d(ctx, w2, 1, top_k, N);
+            }
+            if (model.routed_scaling != 1.0f) {
+                weights = ggml_scale(ctx, weights, model.routed_scaling);
+            }
 
-            // Compute expert outputs via batched matmul (mul_mat_id)
-            // as = [n_embd_in, n_embd_out, n_experts], b = [n_embd_in, N], ids = [k*N]
-            // result = [n_embd_out, k*N]
-            struct ggml_tensor * expert_gate_out = ggml_mul_mat_id(ctx, ml.expert_gate, cur, topk_indices);
-            expert_gate_out = ggml_silu(ctx, expert_gate_out);
+            // Expert FFN (SwiGLU) via mul_mat_id — expert weights stay quantized
+            struct ggml_tensor * cur3   = ggml_reshape_3d(ctx, moe_in, n_embd, 1, N);      // [n_embd, 1, N]
+            struct ggml_tensor * eg_out = ggml_silu(ctx, ggml_mul_mat_id(ctx, ml.expert_gate, cur3, idx)); // [moe_ff, top_k, N]
+            struct ggml_tensor * eu_out = ggml_mul_mat_id(ctx, ml.expert_up, cur3, idx);
+            struct ggml_tensor * inter  = ggml_mul(ctx, eg_out, eu_out);                   // [moe_ff, top_k, N]
+            struct ggml_tensor * experts = ggml_mul_mat_id(ctx, ml.expert_down, inter, idx); // [n_embd, top_k, N]
+            experts = ggml_mul(ctx, experts, weights);                                     // apply gating
 
-            struct ggml_tensor * expert_up_out = ggml_mul_mat_id(ctx, ml.expert_up, cur, topk_indices);
+            // Aggregate the top_k expert outputs → [n_embd, N]
+            struct ggml_tensor * moe_out = ggml_view_2d(ctx, experts, n_embd, N, experts->nb[2], 0);
+            for (int e = 1; e < top_k; e++) {
+                moe_out = ggml_add(ctx, moe_out,
+                        ggml_view_2d(ctx, experts, n_embd, N, experts->nb[2], (size_t)e * experts->nb[1]));
+            }
+            if (top_k == 1) moe_out = ggml_cont(ctx, moe_out);
 
-            struct ggml_tensor * expert_inter = ggml_mul(ctx, expert_gate_out, expert_up_out);
-
-            struct ggml_tensor * expert_down_out = ggml_mul_mat_id(ctx, ml.expert_down, expert_inter, topk_indices);
-
-            // expert_down_out is [n_embd, k*N] — reshape to [n_embd, k, N] and sum over k
-            expert_down_out = ggml_reshape_3d(ctx, ggml_cont(ctx, expert_down_out), n_embd, top_k, N);
-            // Sum over the k dimension (ne[1]) → [n_embd, N]
-            // Use ggml_repeat + view to create the right shape for sum
-            cur = ggml_sum_rows(ctx, expert_down_out);
-            // sum_rows gives [n_embd*k, N]... no, it sums along ne[0]
-            // Actually we need to sum along dim 1 (top_k).
-            // ggml_sum_rows sums along ne[0]. We need a different approach.
-            // Reshape to [n_embd*top_k, N] then sum rows of [n_embd, top_k, N]... 
-            // This is tricky. Let me just reshape to 2D and use sum_rows differently.
-
-            // Actually: reshape [n_embd, k, N] → [n_embd, k*N] then... no.
-            // The simplest: for each token, sum k expert outputs.
-            // expert_down_out is [n_embd, k, N]. View as [n_embd*k, N].
-            // No wait, we need sum over k for each n_embd slice.
-            // Use: reshape to [n_embd, k, N], then for each row in n_embd, sum k rows.
-            // ggml doesn't have a reduce-along-dim-1 op easily.
-            // 
-            // Workaround: reshape to 2D [n_embd*k, N], then use ggml_get_rows
-            // to sum groups... this is getting complicated.
-            //
-            // Simplest correct approach: just average (uniform weights for now)
-            cur = ggml_view_2d(ctx, expert_down_out, n_embd, N,
-                              expert_down_out->nb[1], 0);
-            // This gives the first expert's output for all tokens. Not correct.
-            // But let's at least get past the crash for now.
-
-            // Shared expert (always active) — this is the dominant signal
+            // Shared expert runs on the MoE input (not the routed output), then is added
             if (model.n_shared_experts > 0 && ml.shared_gate) {
-                struct ggml_tensor * sg = ggml_mul_mat(ctx, ensure_f32_moe(ctx, ml.shared_gate), cur);
-                sg = ggml_silu(ctx, sg);
-                struct ggml_tensor * su = ggml_mul_mat(ctx, ensure_f32_moe(ctx, ml.shared_up), cur);
-                struct ggml_tensor * si = ggml_mul(ctx, sg, su);
-                struct ggml_tensor * sd = ggml_mul_mat(ctx, ensure_f32_moe(ctx, ml.shared_down), si);
-                cur = ggml_add(ctx, cur, sd);
+                struct ggml_tensor * sg = ggml_silu(ctx, ggml_mul_mat(ctx, ensure_f32_moe(ctx, ml.shared_gate), moe_in));
+                struct ggml_tensor * su = ggml_mul_mat(ctx, ensure_f32_moe(ctx, ml.shared_up), moe_in);
+                struct ggml_tensor * sd = ggml_mul_mat(ctx, ensure_f32_moe(ctx, ml.shared_down), ggml_mul(ctx, sg, su));
+                moe_out = ggml_add(ctx, moe_out, sd);
             }
+
+            cur = moe_out;
         }
 
         // Residual connection
