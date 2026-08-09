@@ -212,14 +212,14 @@ static struct ggml_cgraph * diffuse_build_graph_moe(
             // Compute expert outputs via batched matmul (mul_mat_id)
             // as = [n_embd_in, n_embd_out, n_experts], b = [n_embd_in, N], ids = [k*N]
             // result = [n_embd_out, k*N]
-            struct ggml_tensor * expert_gate_out = ggml_mul_mat_id(ctx, ensure_f32_moe(ctx, ml.expert_gate), cur, topk_indices);
+            struct ggml_tensor * expert_gate_out = ggml_mul_mat_id(ctx, ml.expert_gate, cur, topk_indices);
             expert_gate_out = ggml_silu(ctx, expert_gate_out);
 
-            struct ggml_tensor * expert_up_out = ggml_mul_mat_id(ctx, ensure_f32_moe(ctx, ml.expert_up), cur, topk_indices);
+            struct ggml_tensor * expert_up_out = ggml_mul_mat_id(ctx, ml.expert_up, cur, topk_indices);
 
             struct ggml_tensor * expert_inter = ggml_mul(ctx, expert_gate_out, expert_up_out);
 
-            struct ggml_tensor * expert_down_out = ggml_mul_mat_id(ctx, ensure_f32_moe(ctx, ml.expert_down), expert_inter, topk_indices);
+            struct ggml_tensor * expert_down_out = ggml_mul_mat_id(ctx, ml.expert_down, expert_inter, topk_indices);
 
             // expert_down_out is [n_embd, k*N] — reshape to [n_embd, k, N] and sum over k
             expert_down_out = ggml_reshape_3d(ctx, ggml_cont(ctx, expert_down_out), n_embd, top_k, N);

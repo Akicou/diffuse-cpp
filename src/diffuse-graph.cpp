@@ -186,7 +186,7 @@ size_t diffuse_compute_buf_size(const diffuse_hparams & hp, int n_tokens) {
     size_t buf_size = per_layer * n_layer;
     buf_size += (size_t)n_tokens * hp.n_vocab * sizeof(float) * 2;
     buf_size += 256ull * 1024 * 1024;
-    buf_size = (size_t)(buf_size * 1.5);
+    buf_size = (size_t)(buf_size * 4.0);
 
     return buf_size;
 }
